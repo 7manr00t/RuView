@@ -31,9 +31,9 @@ It does **not** pick up `sdkconfig.defaults.16mb`, and that file is where
 `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y` lives.
 
 Build without it and you get an image that is correct in every visible respect
-and **cannot roll back a bad OTA** — while `ota_rollback_boot_check()` sits in
-the app expecting the capability. Silent, and only discoverable by pushing a
-deliberately bad image.
+and **cannot roll back a bad OTA**, while `main/ota_health.c` sits in the app
+expecting the capability (it compiles to a no-op without it). Silent, and only
+discoverable by pushing a deliberately bad image. See §2.1.
 
 That is why the command above concatenates all three explicitly rather than
 relying on discovery.
@@ -103,6 +103,46 @@ all of them.
 Corollary: "every node reports health" proves the **app** is current and proves
 nothing about the bootloader. Do not answer a bootloader question with app
 evidence.
+
+### 2.1 An OTA'd image must confirm itself (ADR-379)
+
+On a rollback-capable bootloader an OTA'd image boots **`PENDING_VERIFY`**.
+Until it is confirmed, the **next reset reverts to the previous slot** and
+`POST /ota` refuses a second update. `main/ota_health.c` does the confirming:
+
+- It runs only when the running image is `PENDING_VERIFY`. USB-flashed images
+  (the bootloader writes `VALID`), already-confirmed images, `UNDEFINED` and
+  `NEW` are left alone.
+- It confirms once the STA has an IP **and** the stream sender has accepted at
+  least one CSI frame, but not before `CONFIG_OTA_HEALTH_MIN_UPTIME_S`
+  (default 30 s). Log: `ota_health: marked valid after ... in <ms> ms`.
+- If both signals have not arrived by `CONFIG_OTA_HEALTH_TIMEOUT_S` (default
+  120 s from boot), it logs `health check failed: <reason>, rolling back` and
+  reboots into the previous slot. A crash or reset before confirmation is also
+  a rollback.
+- `GET /ota/status` reports `ota_state`. `pending_verify` means the image is
+  not yet durable. `valid` means it survives a power cycle. `new` after an OTA
+  means this board's bootloader has **no** rollback support.
+
+Consequence for rollouts: wait for `ota_state: "valid"` before pushing again,
+and before power-cycling. If the AP is down when the node boots, a good image
+rolls back. That is expected; re-push it.
+
+**Hardware check, one node.** It needs a node with the OTA PSK provisioned and
+a rollback bootloader.
+
+1. Note `version` and `running_partition` from `/ota/status`.
+2. OTA-push the new image. Watch the log for `OTA image pending verify`, then
+   `marked valid after ... in <ms> ms`. `/ota/status` must show the new
+   version, the other partition, and `ota_state: "valid"`.
+3. Power-cycle it. It must come back on the same version and partition with
+   `ota_state: "valid"`. Before ADR-379 it came back on the old one.
+
+**Negative check.** Build with `CONFIG_OTA_HEALTH_FORCE_FAIL=y` and push it.
+The log must show `health check failed: forced failure ..., rolling back` at
+about `MIN_UPTIME_S`, and the node must come back on the step-2 version and
+partition. Then push a normal image to restore it. Never leave a FORCE_FAIL
+image in `release_bins`.
 
 ---
 

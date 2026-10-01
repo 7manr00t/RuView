@@ -90,14 +90,26 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *update = esp_ota_get_next_update_partition(NULL);
 
+    /* ADR-379: lets an operator confirm remotely that an OTA'd image left
+     * pending_verify (and so survives a power cycle) without a serial log. */
+    esp_ota_img_states_t st;
+    const char *ota_state = "none";
+    if (running && esp_ota_get_state_partition(running, &st) == ESP_OK) {
+        ota_state = st == ESP_OTA_IMG_VALID          ? "valid" :
+                    st == ESP_OTA_IMG_PENDING_VERIFY ? "pending_verify" :
+                    st == ESP_OTA_IMG_NEW            ? "new" :
+                    st == ESP_OTA_IMG_UNDEFINED      ? "undefined" : "other";
+    }
+
     char response[512];
     int len = snprintf(response, sizeof(response),
         "{\"version\":\"%s\",\"date\":\"%s\",\"time\":\"%s\","
         "\"running_partition\":\"%s\",\"next_partition\":\"%s\","
-        "\"max_size\":%lu}",
+        "\"ota_state\":\"%s\",\"max_size\":%lu}",
         app->version, app->date, app->time,
         running ? running->label : "unknown",
         update ? update->label : "none",
+        ota_state,
         (unsigned long)(update ? update->size : 0));
 
     httpd_resp_set_type(req, "application/json");
