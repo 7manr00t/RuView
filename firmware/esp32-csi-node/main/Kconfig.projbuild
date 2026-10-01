@@ -332,6 +332,25 @@ menu "WASM Programmable Sensing (ADR-040)"
 
 endmenu
 
+menu "OTA / WASM HTTP server (ADR-379)"
+
+config OTA_HTTPD_STACK_SIZE
+    int "Stack size of the OTA / WASM HTTP server task (bytes)"
+    range 4096 16384
+    default 8192
+    help
+      HTTPD_DEFAULT_CONFIG() gives 4096. MEASURED 2026-09-29 on an ESP32-S3
+      (node 4, v0.8.12): every POST /ota overflowed it ("stack overflow in
+      task httpd", RTC_SW_CPU_RST), so no OTA had ever completed on this
+      firmware. The same task runs POST /wasm/upload (signature check plus
+      wasm3 module load) and GET /wasm/list.
+
+      Every OTA and WASM upload logs "httpd stack after <handler>: N of M
+      bytes never used". Lower this only with those numbers in hand, and keep
+      at least 1 KB unused on the worst handler.
+
+endmenu
+
 menu "ESP32-C6 capabilities (ADR-110)"
     depends on IDF_TARGET_ESP32C6
 

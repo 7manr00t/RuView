@@ -113,6 +113,16 @@ evidence.
 Works end-to-end and is the default for anything that is not a bootloader or
 partition change. Roll to **one node**, soak it, then the rest.
 
+**Before ADR-379, `POST /ota` never completed on this firmware.** MEASURED
+2026-09-29 on node 4 (S3, v0.8.12): it overflowed the 4 KB httpd stack
+(`stack overflow in task httpd`, `RTC_SW_CPU_RST`), and the node came back on
+its old slot. The client sees `connection reset`. Any board still on an older
+build has to be moved to a fixed one **over USB**.
+
+The server now runs with `CONFIG_OTA_HTTPD_STACK_SIZE` (8192). Each upload
+logs `httpd stack after POST /ota: N of 8192 bytes never used`. Record that
+number when you verify a node, because it is the evidence the size rests on.
+
 ### Over USB — bootloader, partition table, or recovery
 
 ```bash
