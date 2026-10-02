@@ -3,7 +3,8 @@
 Bridges MediaTek MT7981 (`mt76`) vendor CSI into RuView's ADR-267 MTC1 frames and
 sends them to the sensing server's UDP ingest (default `127.0.0.1:5005`).
 
-Developed in whitsentry, a RuView-based project.
+Developed in whitsentry, a RuView-based project. User guide:
+[`docs/mediatek-router-csi.md`](../../../docs/mediatek-router-csi.md).
 
 MT7981B + MT7976C is the silicon in the Wavlink WL-WN586X3, and per the OpenWrt
 hardware tables also in the OpenWrt One and the Xiaomi AX3000T (CLAIMED: only the
