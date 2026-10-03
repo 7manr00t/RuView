@@ -4659,8 +4659,20 @@ struct SourcePlan {
 
 /// Every `--source` value [`plan_source`] accepts. Clap rejects anything else
 /// at startup (issue #2097): an unknown value used to start the server with no
-/// data task while `/api/v1/status` still reported a live source.
-const SOURCE_VALUES: [&str; 5] = ["auto", "esp32", "wifi", "simulated", "simulate"];
+/// data task while `/api/v1/status` still reported a live source. The vendor
+/// names match the labels the UDP receiver writes for MTC1, RAC1, Qualcomm
+/// and RTL8720F radar frames, so `effective_source()` ages them correctly.
+const SOURCE_VALUES: [&str; 9] = [
+    "auto",
+    "esp32",
+    "wifi",
+    "simulated",
+    "simulate",
+    "mediatek",
+    "qualcomm",
+    "realtek",
+    "realtek_csi",
+];
 
 /// Pure decision function — fully unit-testable without binding sockets.
 ///
@@ -4720,6 +4732,16 @@ fn plan_source(
             bind_udp: false,
             run_simulator: false,
             run_wifi: true,
+        },
+        // Vendor CSI and radar frames arrive on the same UDP receiver as ESP32
+        // frames. Before #2097 these names fell into a catch-all that bound no
+        // receiver, so nothing was ever ingested. Never run the ESP32-shaped
+        // simulator alongside a vendor feed.
+        "mediatek" | "qualcomm" | "realtek" | "realtek_csi" => SourcePlan {
+            initial_source: requested.to_string(),
+            bind_udp: true,
+            run_simulator: false,
+            run_wifi: false,
         },
         other => {
             return Err(format!(
@@ -4925,8 +4947,47 @@ mod issue_2097_status_tests {
     }
 
     #[test]
+    fn vendor_sources_bind_the_udp_receiver() {
+        for vendor in ["mediatek", "qualcomm", "realtek", "realtek_csi"] {
+            let plan = plan_source(vendor, false, false).expect("vendor source plans");
+            assert!(plan.bind_udp, "{vendor}: vendor frames arrive over UDP");
+            assert!(!plan.run_simulator, "{vendor}: no ESP32-shaped simulator");
+            assert!(!plan.run_wifi);
+            assert_eq!(plan.initial_source, vendor);
+        }
+    }
+
+    #[test]
+    fn only_garbage_is_rejected() {
+        for bogus in [
+            "bogus",
+            "macos",
+            "linux",
+            "mock",
+            "MEDIATEK",
+            "mediatek:simulated",
+            "esp32 ",
+        ] {
+            assert!(
+                Args::try_parse_from(["sensing-server", "--source", bogus]).is_err(),
+                "--source {bogus:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn every_documented_source_still_parses() {
-        for source in ["auto", "esp32", "wifi", "simulated", "simulate"] {
+        for source in [
+            "auto",
+            "esp32",
+            "wifi",
+            "simulated",
+            "simulate",
+            "mediatek",
+            "qualcomm",
+            "realtek",
+            "realtek_csi",
+        ] {
             let args = Args::try_parse_from(["sensing-server", "--source", source])
                 .unwrap_or_else(|e| panic!("--source {source} must parse: {e}"));
             assert_eq!(args.source, source);

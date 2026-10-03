@@ -303,7 +303,9 @@ All endpoints return JSON. In simulated mode, data is generated from a determini
 ## Data Sources
 
 The `--source` flag controls where CSI data comes from. Valid values are
-`auto`, `esp32`, `wifi`, and `simulated` (alias `simulate`). Any other value
+`auto`, `esp32`, `wifi`, and `simulated` (alias `simulate`), plus the vendor
+feeds `mediatek`, `qualcomm`, `realtek` (RTL8720F radar), and `realtek_csi`
+(RTL8721Dx CSI), which bind the UDP receiver like `esp32`. Any other value
 stops the server at startup with an error that lists them.
 
 ### Simulated Mode (No Hardware)
@@ -1287,7 +1289,7 @@ The Rust sensing server binary accepts the following flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source` | `auto` | Data source: `auto`, `esp32`, `wifi`, `simulated` (alias `simulate`). Other values are rejected at startup |
+| `--source` | `auto` | Data source: `auto`, `esp32`, `wifi`, `simulated` (alias `simulate`), `mediatek`, `qualcomm`, `realtek`, `realtek_csi`. Other values are rejected at startup |
 | `--http-port` | `8080` | HTTP port for REST API and UI |
 | `--ws-port` | `8765` | WebSocket port |
 | `--udp-port` | `5005` | UDP port for ESP32 CSI frames |
