@@ -1,6 +1,6 @@
 [package]
 name = "ruview-spatial-evidence"
-description = "Emit RuView RF Gaussians and link measurements as spatial.evidence.v1 JSONL (WeftOS ADR-107 wire contract)"
+description = "Emit RuView RF Gaussians and link measurements as spatial.evidence.v1 JSONL (ADR-382)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true

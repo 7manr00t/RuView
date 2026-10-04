@@ -1,5 +1,6 @@
-//! Wire-contract tests: golden lines match the WeftOS ADR-107 §7 examples,
-//! conversions mirror their sources, and invalid values never serialise.
+//! Wire-contract tests: golden lines match the ADR-382 examples (copied
+//! verbatim from WeftOS ADR-107 §7), conversions mirror their sources, and
+//! invalid values never serialise.
 
 use ruview_spatial_evidence::{
     free_space_amplitude, gaussian_to_record, map_to_records, parse_line, to_jsonl, to_line,
@@ -9,9 +10,15 @@ use ruview_spatial_evidence::{
 use ruview_unified::gaussian::{GaussianMap, MotionState, Provenance as UProv, RfGaussian};
 use serde_json::Value;
 
-/// ADR-107 §7 example lines for the two RF types, verbatim.
+/// ADR-382 / ADR-107 §7 example lines for the two RF types, verbatim.
 const ADR_RF_LINK: &str = r#"{"schema":"spatial.evidence.v1","type":"rf_link_observation","t_ns":1759500001300000000,"frame":"room_enu","region":"region/urth/meso/test-room","source_id":"node-2","uncertainty_m":1.0,"provenance":{"receipt":"csi:node1-node2:000881","producer":"ruview-adapter@0.1","proof":"MEASURED"},"tx":[6.20,3.50,1.10],"rx":[0.20,0.20,1.10],"freq_hz":2437000000.0,"excess_loss_db":4.2}"#;
 const ADR_RF_GAUSSIAN: &str = r#"{"schema":"spatial.evidence.v1","type":"rf_gaussian","t_ns":1759500002000000000,"frame":"room_enu","region":"region/urth/meso/test-room","source_id":"ruview-unified","uncertainty_m":0.5,"provenance":{"receipt":"gauss:7f3a","producer":"ruview-unified@0.3","proof":"CODE"},"position":[3.2,0.0,1.2],"scale":[0.05,1.6,1.2],"orientation":[1,0,0,0],"occupancy":0.7,"confidence":0.8,"motion":"static","role":"absorber"}"#;
+
+/// The 2026-10-03 ADR-107 amendment's mounted-sensor lines, verbatim. This
+/// crate does not mirror them, so they must fail as unknown types.
+const ADR_TOF_DEPTH: &str = r#"{"schema":"spatial.evidence.v1","type":"tof_depth","t_ns":1759500004000000000,"frame":"room_enu","region":"region/urth/meso/test-room","source_id":"sen0628-1","uncertainty_m":0.02,"provenance":{"receipt":"sen0628-1:000042","producer":"sen0628-tof@0.1.0","proof":"MEASURED"},"position":[4.80,0.05,1.60],"yaw_deg":90.0,"pitch_deg":-35.0,"fov_deg":[60.0,60.0],"grid":[4,4],"range_mm":[0,0,0,0,3290,3105,3110,3302,2512,1190,1185,2530,2005,1072,1066,2011],"valid":[false,false,false,false,true,true,true,true,true,true,true,true,true,true,true,true]}"#;
+const ADR_RADAR_RANGE: &str = r#"{"schema":"spatial.evidence.v1","type":"radar_range","t_ns":1759500004100000000,"frame":"room_enu","region":"region/urth/meso/test-room","source_id":"rd03e-1","uncertainty_m":0.3,"provenance":{"receipt":"rd03e-1:000007","producer":"rd-03e@0.1.0","proof":"MEASURED"},"position":[0.10,1.83,1.00],"yaw_deg":0.0,"fov_deg":[90.0,60.0],"range_m":2.45,"targets":1}"#;
+const ADR_RADAR_TRACK_SENSOR: &str = r#"{"schema":"spatial.evidence.v1","type":"radar_track_point","t_ns":1759500001350000000,"frame":"room_enu","region":"region/urth/meso/test-room","source_id":"ld2450-1","uncertainty_m":0.3,"provenance":{"receipt":"ld2450-1:000124","producer":"ld2450-radar@0.1.0","proof":"MEASURED"},"track":1,"position":[2.60,1.30,0.0],"sensor":{"position":[0.50,0.50,1.80],"yaw_deg":26.0,"pitch_deg":-10.0,"elev_half_deg":35.0,"az_half_deg":60.0}}"#;
 
 const REGION: &str = "region/urth/meso/test-room";
 
@@ -336,4 +343,35 @@ fn parse_line_rejects_wrong_version_type_overflow_and_length() {
         parse_line(&long),
         Err(EvidenceError::LineTooLong(_))
     ));
+}
+
+#[test]
+fn non_rf_types_are_unknown_to_this_emitter() {
+    for line in [ADR_TOF_DEPTH, ADR_RADAR_RANGE, ADR_RADAR_TRACK_SENSOR] {
+        let err = parse_line(line).expect_err("not mirrored here");
+        let EvidenceError::Parse(msg) = err else {
+            panic!("expected an unknown-type parse error, got {err:?}")
+        };
+        assert!(msg.contains("unknown variant"), "{msg}");
+    }
+}
+
+#[test]
+fn gaussian_orientation_follows_the_v1_yaw_convention() {
+    // v1 yaw is counter-clockwise from room +x. A quaternion for +90° about
+    // +z must therefore turn the Gaussian's local x axis onto room +y, and
+    // reach the wire unchanged.
+    let h = std::f64::consts::FRAC_PI_4;
+    let mut g = gaussian("node-1", false);
+    g.orientation = [h.cos(), 0.0, 0.0, h.sin()];
+    let r = g.rotation();
+    let local_x = [r[0][0], r[1][0], r[2][0]];
+    for (got, want) in local_x.iter().zip([0.0, 1.0, 0.0]) {
+        assert!((got - want).abs() < 1e-12, "{local_x:?}");
+    }
+    let rec = gaussian_to_record(&g, 0, &export(ProofTag::Code)).unwrap();
+    let RecordBody::RfGaussian(body) = &rec.body else {
+        panic!("wrong type")
+    };
+    assert_eq!(body.orientation, g.orientation);
 }

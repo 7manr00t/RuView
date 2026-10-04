@@ -1,7 +1,8 @@
 //! # `ruview-spatial-evidence` — RuView output as `spatial.evidence.v1` JSONL
 //!
 //! `spatial.evidence.v1` is the versioned, one-record-per-line wire format
-//! of the WeftOS spatial evidence engine (WeftOS ADR-107 §7). This crate is
+//! of the WeftOS spatial evidence engine. ADR-382 records the RF part of the
+//! contract in this repository; WeftOS ADR-107 §7 is its origin. This crate is
 //! the RuView-side emitter for the two RF record types RuView can produce:
 //!
 //! - [`gaussian`]: `ruview_unified` [`RfGaussian`](ruview_unified::gaussian::RfGaussian)s

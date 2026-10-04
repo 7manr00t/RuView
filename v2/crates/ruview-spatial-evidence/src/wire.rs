@@ -1,9 +1,16 @@
 //! `spatial.evidence.v1` envelope, the two RF record bodies, and the
-//! boundary validation rules (WeftOS ADR-107 §7).
+//! boundary validation rules (ADR-382, which records WeftOS ADR-107 §7).
 //!
 //! Only the RF types RuView emits are mirrored. A line of any other `type`
-//! is rejected by [`parse_line`] here, which is correct for an emitter: it
-//! never needs to read shell, pose or radar lines back.
+//! (`shell_measure`, `pose`, `radar_track_point`, `uwb_echo`, `imu_event`,
+//! `human_confirm`, `tof_depth`, `radar_range`) is rejected by
+//! [`parse_line`] here as an unknown type, which is correct for an emitter:
+//! it never needs to read those lines back.
+//!
+//! Angles: every yaw in v1 is degrees counter-clockwise from room +x
+//! (east), so 0 faces +x and 90 faces +y. The RF types carry no yaw field;
+//! an `rf_gaussian` orientation is a room-ENU rotation quaternion, whose
+//! rotation about +z follows the same counter-clockwise sense.
 
 use serde::{Deserialize, Serialize};
 
@@ -208,7 +215,8 @@ pub struct RfGaussianRecord {
     pub position: [f64; 3],
     /// Per-axis σ, metres.
     pub scale: [f64; 3],
-    /// Orientation quaternion `[w, x, y, z]`.
+    /// Orientation quaternion `[w, x, y, z]`, body to room ENU (a positive
+    /// rotation about +z turns the local x axis counter-clockwise from east).
     pub orientation: [f64; 4],
     /// Peak extinction, nepers/metre.
     pub occupancy: f64,
