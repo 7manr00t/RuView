@@ -148,14 +148,14 @@ impl CsiPipelineState {
         // path, not only in tests.
         if self.total_frames % 500 == 0 {
             eprintln!(
-                "  CSI node={} ch={} ant={} sub={} rssi={} nf={} ts_us={} iq_bytes={}",
+                "  CSI node={} freq_mhz={} ant={} sub={} rssi={} nf={} seq={} iq_bytes={}",
                 frame.node_id,
-                frame.channel,
+                frame.freq_mhz,
                 frame.n_antennas,
                 frame.n_subcarriers,
                 frame.rssi,
                 frame.noise_floor,
-                frame.timestamp_us,
+                frame.sequence,
                 frame.iq_data.len(),
             );
         }
@@ -732,10 +732,10 @@ mod tests {
                 node_id: 1,
                 n_antennas: 1,
                 n_subcarriers: 32,
-                channel: 6,
+                freq_mhz: 2437,
                 rssi: -50,
                 noise_floor: -90,
-                timestamp_us: 10_000 + i,
+                sequence: 10_000 + i,
                 iq_data: vec![0i8; 64],
                 amplitudes: vec![f32::NAN; 32],
                 phases: vec![f32::INFINITY; 32],
