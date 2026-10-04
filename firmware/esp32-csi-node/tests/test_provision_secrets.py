@@ -214,5 +214,132 @@ class TestIntermediateArtifacts(_TempDirCase):
         self.assertEqual(seen["csv_mode"], 0o600)
 
 
+class TestPasswordInput(_TempDirCase):
+    """Ways to give the password without putting it on the command line."""
+
+    BASE = ("--port", "COM7", "--target-ip", "192.0.2.10")
+
+    def setUp(self):
+        super().setUp()
+        self.flashed_csv = []
+
+    def password_file(self, content, mode=0o600):
+        path = os.path.join(self.root, "wifi-pass.txt")
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+        os.chmod(path, mode)
+        return path
+
+    def provision(self, *argv, tty=False, typed=None):
+        """Run main() with flashing stubbed; return (code, stderr, getpass mock)."""
+        def fake_generate(csv_content, _size):
+            self.flashed_csv.append(csv_content)
+            return b"nvs"
+
+        stdin = mock.Mock()
+        stdin.isatty.return_value = tty
+        # read_chip_mac only exists once state is keyed by board MAC (#1755);
+        # stub it so these tests never reach esptool or a serial port.
+        with mock.patch.object(provision, "generate_nvs_binary", side_effect=fake_generate), \
+                mock.patch.object(provision, "flash_nvs"), \
+                mock.patch.object(provision, "read_chip_mac", return_value=None,
+                                  create=True), \
+                mock.patch.object(sys, "stdin", stdin), \
+                mock.patch("getpass.getpass", return_value=typed) as prompt:
+            code, _, err = self.run_main(*self.BASE, *argv, "--state-dir", self.state_dir)
+        return code, err, prompt
+
+    def flashed_password(self):
+        rows = provision.csv.DictReader(io.StringIO(self.flashed_csv[-1]))
+        return {row["key"]: row["value"] for row in rows}.get("password")
+
+    def test_password_file_is_read_and_one_newline_dropped(self):
+        path = self.password_file(FAKE_PASSWORD + "  \n\n")
+
+        code, err, _ = self.provision("--ssid", "test-ssid", "--password-file", path)
+
+        self.assertEqual(code, 0)
+        # Only one newline goes; trailing spaces and the second newline stay.
+        self.assertEqual(self.flashed_password(), FAKE_PASSWORD + "  \n")
+        self.assertNotIn("visible in ps", err)
+
+    def test_password_file_crlf_counts_as_one_newline(self):
+        path = self.password_file(FAKE_PASSWORD + "\r\n")
+        self.provision("--ssid", "test-ssid", "--password-file", path)
+        self.assertEqual(self.flashed_password(), FAKE_PASSWORD)
+
+    @POSIX_ONLY
+    def test_group_or_world_readable_password_file_is_refused(self):
+        for mode in (0o644, 0o640, 0o604):
+            with self.subTest(mode=oct(mode)):
+                path = self.password_file(FAKE_PASSWORD + "\n", mode)
+                code, err, _ = self.provision("--ssid", "test-ssid", "--password-file", path)
+                self.assertEqual(code, 2)
+                self.assertIn("chmod 600", err)
+
+    @POSIX_ONLY
+    def test_insecure_password_file_allowed_with_flag_and_warning(self):
+        path = self.password_file(FAKE_PASSWORD + "\n", 0o644)
+
+        code, err, _ = self.provision("--ssid", "test-ssid", "--password-file", path,
+                                      "--allow-insecure-password-file")
+
+        self.assertEqual(code, 0)
+        self.assertIn("readable by group or others", err)
+        self.assertEqual(self.flashed_password(), FAKE_PASSWORD)
+
+    def test_missing_or_empty_password_file_is_an_error(self):
+        missing = os.path.join(self.root, "nope.txt")
+        code, err, _ = self.provision("--ssid", "test-ssid", "--password-file", missing)
+        self.assertEqual(code, 2)
+        self.assertIn("does not exist", err)
+
+        empty = self.password_file("\n")
+        code, err, _ = self.provision("--ssid", "test-ssid", "--password-file", empty)
+        self.assertEqual(code, 2)
+        self.assertIn("is empty", err)
+
+    def test_password_and_password_file_are_mutually_exclusive(self):
+        path = self.password_file(FAKE_PASSWORD)
+
+        code, err, _ = self.provision("--ssid", "test-ssid", "--password", FAKE_PASSWORD,
+                                      "--password-file", path)
+
+        self.assertEqual(code, 2)
+        self.assertIn("not allowed with argument", err)
+
+    def test_password_on_command_line_warns(self):
+        code, err, _ = self.provision("--ssid", "test-ssid", "--password", FAKE_PASSWORD)
+
+        self.assertEqual(code, 0)
+        self.assertIn("--password is visible in ps and shell history", err)
+        self.assertIn("--password-file", err)
+
+    def test_terminal_prompts_for_password_of_a_new_ssid(self):
+        code, _, prompt = self.provision("--ssid", "test-ssid", tty=True, typed=FAKE_PASSWORD)
+
+        self.assertEqual(code, 0)
+        prompt.assert_called_once()
+        self.assertEqual(self.flashed_password(), FAKE_PASSWORD)
+        self.assertEqual(provision.load_state("COM7", self.state_dir)["password"], FAKE_PASSWORD)
+
+    def test_no_prompt_when_saved_password_matches_the_ssid(self):
+        provision.save_state("COM7", self.state_dir,
+                             {"ssid": "test-ssid", "password": FAKE_PASSWORD})
+
+        code, _, prompt = self.provision("--ssid", "test-ssid", tty=True, typed="unused")
+
+        self.assertEqual(code, 0)
+        prompt.assert_not_called()
+        self.assertEqual(self.flashed_password(), FAKE_PASSWORD)
+
+    def test_no_prompt_without_a_terminal(self):
+        code, err, prompt = self.provision("--ssid", "test-ssid", tty=False, typed="unused")
+
+        prompt.assert_not_called()
+        self.assertEqual(code, 2)
+        self.assertIn("--password", err)
+
+
 if __name__ == "__main__":
     unittest.main()

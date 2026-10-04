@@ -41,6 +41,7 @@ ADDITIVE-BY-DEFAULT (issue #391, #574 phase 1):
 
 import argparse
 import csv
+import getpass
 import io
 import json
 import os
@@ -206,6 +207,43 @@ def redact_secrets(state: dict) -> dict:
         if shown.get(name) is not None:
             shown[name] = "(set)" if shown[name] else "(empty)"
     return shown
+
+
+def read_password_file(path: str, allow_insecure: bool = False) -> str:
+    """Read the WiFi password from `path`, dropping one trailing newline.
+
+    Keeps the password out of argv and shell history (#1754). Refuses a file
+    that group or others can read unless `allow_insecure` is set. Raises
+    ValueError with a message meant for the user.
+    """
+    try:
+        with open(path, "rb") as f:
+            mode = stat.S_IMODE(os.fstat(f.fileno()).st_mode)
+            data = f.read()
+    except FileNotFoundError:
+        raise ValueError(f"--password-file {path} does not exist") from None
+    except OSError as exc:
+        raise ValueError(f"could not read --password-file {path}: {exc}") from None
+    if sys.platform != "win32" and mode & 0o044:
+        if not allow_insecure:
+            raise ValueError(
+                f"--password-file {path} is readable by group or others "
+                f"(mode {oct(mode)}). Run 'chmod 600 {path}', or pass "
+                f"--allow-insecure-password-file."
+            )
+        print(f"WARNING: --password-file {path} is readable by group or others "
+              f"(mode {oct(mode)}).", file=sys.stderr)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"--password-file {path} is not UTF-8 text") from None
+    if text.endswith("\r\n"):
+        text = text[:-2]
+    elif text.endswith("\n"):
+        text = text[:-1]
+    if not text:
+        raise ValueError(f"--password-file {path} is empty")
+    return text
 
 
 def load_state(port: str, state_dir: str) -> dict:
@@ -425,7 +463,16 @@ def main():
     )
     parser.add_argument("--baud", type=int, default=460800, help="Flash baud rate (default: 460800)")
     parser.add_argument("--ssid", help="WiFi SSID")
-    parser.add_argument("--password", help="WiFi password")
+    password_source = parser.add_mutually_exclusive_group()
+    password_source.add_argument("--password",
+                                 help="WiFi password. Visible in ps and shell history; "
+                                 "prefer --password-file.")
+    password_source.add_argument("--password-file", metavar="PATH",
+                                 help="Read the WiFi password from PATH (one trailing newline "
+                                 "is dropped). The file must not be readable by group or others.")
+    parser.add_argument("--allow-insecure-password-file", action="store_true",
+                        help="Accept a --password-file that group or others can read, with a "
+                        "warning (e.g. a read-only 0444 secrets mount).")
     parser.add_argument("--target-ip", help="Aggregator host IP (e.g. 192.168.1.20)")
     parser.add_argument("--target-port", type=int, help="Aggregator UDP port (default: 5005)")
     parser.add_argument("--node-id", type=int, help="Node ID 0-255 (default: 1)")
@@ -479,6 +526,17 @@ def main():
     # or early exit (#1754).
     harden_state_dir(args.state_dir)
 
+    if args.password_file is not None:
+        try:
+            args.password = read_password_file(
+                args.password_file, args.allow_insecure_password_file)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.password is not None:
+        print("WARNING: --password is visible in ps and shell history; "
+              "use --password-file instead.", file=sys.stderr)
+    cli_ssid, cli_password = args.ssid, args.password
+
     # --- Per-port state load + merge (additive-by-default, #391 / #574) ---
     if args.reset:
         path = _state_path_for(args.port, args.state_dir)
@@ -489,6 +547,16 @@ def main():
     else:
         prior = load_state(args.port, args.state_dir)
     merged = merge_state_into_args(args, prior)
+
+    # A new --ssid with no password given: ask for it on a terminal instead of
+    # requiring it on the command line. The saved password is reused only when
+    # it belongs to the same SSID. Without a terminal (scripts, CI) nothing is
+    # asked and the WiFi-credential check below applies as before.
+    if (not args.state and cli_ssid is not None and cli_password is None
+            and (prior.get("password") is None or prior.get("ssid") != cli_ssid)
+            and sys.stdin.isatty()):
+        args.password = getpass.getpass(f"WiFi password for {cli_ssid}: ")
+        merged["password"] = args.password
 
     if args.state:
         shown = merged if args.show_secrets else redact_secrets(merged)
