@@ -38,7 +38,7 @@ use wifi_densepose_bfld::{PrivacyClass, PrivacyMode};
 use wifi_densepose_engine::{AdapterInfo, EngineError, StreamingEngine, TrustedOutput};
 use wifi_densepose_geo::types::GeoRegistration;
 use wifi_densepose_signal::ruvsense::fusion_quality::CalibrationId;
-use wifi_densepose_signal::ruvsense::multistatic::MultistaticConfig;
+use wifi_densepose_signal::ruvsense::multistatic::{MultistaticConfig, PhaseFusion};
 use wifi_densepose_worldgraph::WorldId;
 
 use super::multistatic_bridge::node_frames_from_states_with_guard;
@@ -77,6 +77,8 @@ pub struct EngineBridge {
     engine_error_count: u64,
     /// Last time an engine error was actually logged (rate limiter).
     last_error_warn_at: Option<Instant>,
+    /// Phase-combining mode of the most recent successful cycle (#1752).
+    phase_fusion: Option<PhaseFusion>,
 }
 
 impl EngineBridge {
@@ -118,6 +120,7 @@ impl EngineBridge {
             demoted: false,
             engine_error_count: 0,
             last_error_warn_at: None,
+            phase_fusion: None,
         }
     }
 
@@ -218,6 +221,7 @@ impl EngineBridge {
                 self.recalibration_recommended = trust.recalibration_recommended;
                 self.effective_class = Some(trust.effective_class);
                 self.demoted = trust.demoted;
+                self.phase_fusion = Some(trust.phase_fusion);
                 Some(trust)
             }
             Err(e) => {
@@ -258,6 +262,12 @@ impl EngineBridge {
     /// Whether the most recent cycle was demoted (contradiction / mesh risk).
     pub fn demoted(&self) -> bool {
         self.demoted
+    }
+
+    /// Phase-combining mode of the most recent successful cycle (#1752);
+    /// `None` until a governed cycle has run.
+    pub fn phase_fusion(&self) -> Option<PhaseFusion> {
+        self.phase_fusion
     }
 
     /// Engine cycles that returned an error since startup.
@@ -306,6 +316,20 @@ mod tests {
         assert!(out.is_none());
         // No belief published, no sensor wired.
         assert_eq!(bridge.registered_node_count(), 0);
+    }
+
+    /// Issue #1752: the live amplitude-only path reports that phase was not
+    /// combined, with the reason, instead of implying coherent fusion.
+    #[test]
+    fn live_cycle_reports_amplitude_only_phase_fusion() {
+        use wifi_densepose_signal::ruvsense::multistatic::NonCoherentReason;
+        let mut bridge = EngineBridge::new(PrivacyMode::PrivateHome, 1, "living_room", "Living Room", None);
+        assert_eq!(bridge.phase_fusion(), None);
+        bridge.observe_cycle(&two_node_states(), 10_000).expect("cycle succeeds");
+        let mode = bridge.phase_fusion().expect("recorded after a cycle");
+        assert_eq!(mode, PhaseFusion::AmplitudeOnly(NonCoherentReason::PhaseUnavailable));
+        assert_eq!(mode.mode_str(), "amplitude_only");
+        assert_eq!(mode.reason().map(NonCoherentReason::as_str), Some("phase_unavailable"));
     }
 
     #[test]
