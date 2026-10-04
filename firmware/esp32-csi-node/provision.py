@@ -28,6 +28,11 @@ ADDITIVE-BY-DEFAULT (issue #391, #574 phase 1):
         3. Generate + flash NVS from the merged state.
         4. Write the merged state back to the state file.
 
+    State is keyed by the board's MAC, read with esptool, so a board plugged
+    into a port another board used doesn't inherit its node_id (#1755).
+    Port-keyed files from earlier versions move to the board's record the
+    first time that board is provisioned.
+
     Net effect: partial reconfigure works the way users expect. Pass `--reset`
     to wipe both the state file AND the device NVS for first-time provisioning
     of a recycled board.
@@ -44,6 +49,7 @@ import csv
 import io
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -154,6 +160,114 @@ def save_state(port: str, state_dir: str, state: dict) -> str:
         json.dump(state, f, indent=2, sort_keys=True)
         f.write("\n")
     os.replace(tmp, path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Board identity (#1755)
+# ---------------------------------------------------------------------------
+#
+# Serial port names get reused when boards are swapped, so a port-keyed state
+# file hands one board's node_id to the next. State is keyed by the chip's
+# base MAC instead. Each record also stores the MAC and the port it was last
+# written from, so --state can find it without opening the port.
+
+STATE_MAC_KEY = "_chip_mac"
+STATE_PORT_KEY = "_port"
+
+_ESPTOOL_MAC_RE = re.compile(
+    r"^\s*(BASE MAC|MAC):\s*((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})\s*$", re.MULTILINE
+)
+
+
+def normalize_mac(value: str):
+    """Return `value` as lowercase aa:bb:cc:dd:ee:ff, or None if it isn't a MAC."""
+    parts = re.split(r"[:-]", value.strip())
+    if len(parts) != 6 or not all(re.fullmatch(r"[0-9a-fA-F]{2}", p) for p in parts):
+        return None
+    return ":".join(p.lower() for p in parts)
+
+
+def parse_esptool_mac(output: str):
+    """Return the base MAC from `esptool read_mac` output, or None.
+
+    Most chips print one 6-byte "MAC:" line. EUI-64 chips (C5, C6, H2) print an
+    8-byte "MAC:" line, then "BASE MAC:" with the 6-byte address.
+    """
+    found = {label: mac.lower() for label, mac in _ESPTOOL_MAC_RE.findall(output)}
+    return found.get("BASE MAC") or found.get("MAC")
+
+
+def read_chip_mac(port: str, baud: int, chip: str):
+    """Read the connected board's base MAC with esptool. None if it can't."""
+    cmd = [
+        sys.executable, "-m", "esptool",
+        "--chip", chip,
+        "--port", port,
+        "--baud", str(baud),
+        "read_mac",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_esptool_mac(result.stdout)
+
+
+def mac_state_key(mac: str) -> str:
+    """State-file key for a board, e.g. mac-aabbccddeeff."""
+    return "mac-" + mac.replace(":", "")
+
+
+def boards_last_on_port(port: str, state_dir: str) -> list:
+    """MACs of boards whose state was last written from `port`, newest first."""
+    if not os.path.isdir(state_dir):
+        return []
+    found = []
+    for name in os.listdir(state_dir):
+        if not (name.startswith("mac-") and name.endswith(".json")):
+            continue
+        data = load_state(name[:-len(".json")], state_dir)
+        mac = data.get(STATE_MAC_KEY)
+        if data.get(STATE_PORT_KEY) == port and mac:
+            found.append((os.path.getmtime(os.path.join(state_dir, name)), mac))
+    return [mac for _, mac in sorted(found, reverse=True)]
+
+
+def load_board_state(port: str, mac, state_dir: str):
+    """Return (prior state, legacy path) for the board `mac` on `port`.
+
+    Without a MAC this is the old port-keyed lookup. With one, the board's own
+    record wins. If it has none but a port-keyed file from an earlier version
+    exists, that file is returned for migration along with its path.
+    """
+    if mac is None:
+        return load_state(port, state_dir), None
+    prior = load_state(mac_state_key(mac), state_dir)
+    if prior:
+        return prior, None
+    legacy = _state_path_for(port, state_dir)
+    if os.path.isfile(legacy):
+        return load_state(port, state_dir), legacy
+    return {}, None
+
+
+def save_board_state(port: str, mac, state_dir: str, state: dict, legacy=None) -> str:
+    """Persist `state` under the board's MAC (or the port if the MAC is unknown).
+
+    A migrated port-keyed file is removed afterwards, so no other board on that
+    port can pick it up.
+    """
+    if mac is None:
+        return save_state(port, state_dir, state)
+    state = dict(state)
+    state[STATE_MAC_KEY] = mac
+    state[STATE_PORT_KEY] = port
+    path = save_state(mac_state_key(mac), state_dir, state)
+    if legacy and os.path.isfile(legacy):
+        os.unlink(legacy)
     return path
 
 
@@ -365,11 +479,43 @@ def main():
                         "previously-staged keys should NOT be re-applied.")
     parser.add_argument("--state-dir", default=_default_state_dir(),
                         help="Override the per-user state directory (default: per-OS user config dir).")
+    parser.add_argument("--mac", type=str,
+                        help="Board MAC (AA:BB:CC:DD:EE:FF) whose state to use. Normally read "
+                        "from the chip with esptool; --state and --dry-run never open the "
+                        "port, so pass it there to pick a board.")
     parser.add_argument("--state", action="store_true",
                         help="Print the merged state that WOULD be flashed for this port and exit. "
                         "Useful for debugging which keys are about to land on the device.")
 
     args = parser.parse_args()
+
+    # --- Board identity (#1755) ---
+    # State is keyed by the chip's MAC so a board swapped onto a reused port
+    # doesn't inherit the previous board's node_id.
+    if args.mac is not None:
+        chip_mac = normalize_mac(args.mac)
+        if chip_mac is None:
+            parser.error(f"--mac must be in AA:BB:CC:DD:EE:FF format, got '{args.mac}'")
+    elif args.state:
+        # Inspection only: don't open the port; show the board last
+        # provisioned from it.
+        recent = boards_last_on_port(args.port, args.state_dir)
+        chip_mac = recent[0] if recent else None
+        if chip_mac:
+            print(f"Showing board {chip_mac}, last provisioned on {args.port}. "
+                  f"Pass --mac to pick another.", file=sys.stderr)
+    elif args.dry_run:
+        # No board involved; keep the port-keyed state as before.
+        chip_mac = None
+    else:
+        chip_mac = read_chip_mac(args.port, args.baud, args.chip)
+        if chip_mac:
+            print(f"Board MAC: {chip_mac}")
+        else:
+            print(f"WARNING: could not read the board's MAC with esptool, so state "
+                  f"stays keyed by port {args.port}. Pass --mac to key it by board.",
+                  file=sys.stderr)
+    legacy = None
 
     # --- Per-port state load + merge (additive-by-default, #391 / #574) ---
     if args.reset:
@@ -379,7 +525,12 @@ def main():
             print(f"--reset: removed state file {path}", file=sys.stderr)
         prior = {}
     else:
-        prior = load_state(args.port, args.state_dir)
+        prior, legacy = load_board_state(args.port, chip_mac, args.state_dir)
+        if legacy:
+            print(f"Using port-keyed state {legacy} for board {chip_mac}; it moves to "
+                  f"the board's own record when state is next saved. If this isn't the "
+                  f"board last provisioned on {args.port}, rerun with --reset.",
+                  file=sys.stderr)
     merged = merge_state_into_args(args, prior)
 
     if args.state:
@@ -403,11 +554,12 @@ def main():
         ] if val is None or val == ""
     ]
     if wifi_trio_missing and not args.force_partial:
+        state_key = mac_state_key(chip_mac) if chip_mac else args.port
         parser.error(
             f"Missing required WiFi credentials after merging prior state: "
             f"{', '.join(wifi_trio_missing)}.\n"
             f"\n"
-            f"  No per-port state file at {_state_path_for(args.port, args.state_dir)}\n"
+            f"  No saved state at {_state_path_for(state_key, args.state_dir)}\n"
             f"  and the CLI didn't include them. Either pass --ssid + --password + --target-ip\n"
             f"  on this run, or add --force-partial to flash without WiFi.\n"
         )
@@ -504,7 +656,7 @@ def main():
               f"write_flash 0x9000 {out}")
         # Persist merged state even on dry-run so a subsequent real flash from
         # this machine sees the same staged config.
-        path = save_state(args.port, args.state_dir, merged)
+        path = save_board_state(args.port, chip_mac, args.state_dir, merged, legacy)
         print(f"State persisted to {path}")
         return
 
@@ -512,7 +664,7 @@ def main():
     # Persist merged state after a successful flash so future partial
     # invocations from this machine merge on top of what's actually on the
     # device. This is the heart of the additive-by-default fix (#391/#574).
-    path = save_state(args.port, args.state_dir, merged)
+    path = save_board_state(args.port, chip_mac, args.state_dir, merged, legacy)
     print(f"State persisted to {path}")
 
 
