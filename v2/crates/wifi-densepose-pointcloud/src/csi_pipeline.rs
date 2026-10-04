@@ -559,7 +559,9 @@ pub fn start_pipeline(bind_addr: &str) -> Arc<Mutex<CsiPipelineState>> {
             .unwrap();
         eprintln!("  CSI pipeline: listening on {addr}");
 
-        let mut buf = [0u8; 2048];
+        // ADR-018 frames are at most 20 + 2048 bytes (firmware CSI_MAX_FRAME_SIZE);
+        // a 2048-byte buffer would truncate the largest ones.
+        let mut buf = [0u8; 4096];
         loop {
             match socket.recv_from(&mut buf) {
                 Ok((n, _)) => {

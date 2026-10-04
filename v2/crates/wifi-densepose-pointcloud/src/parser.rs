@@ -276,4 +276,20 @@ mod tests {
             "feature-state packet must not be decoded as CSI"
         );
     }
+
+    #[test]
+    fn golden_s3_306_subcarrier_frame_parses() {
+        // Real ESP32-S3 frames at 2432 MHz carry 306 subcarriers, 1 antenna.
+        let mut f = GOLDEN_HEADER.to_vec();
+        f[6..8].copy_from_slice(&306u16.to_le_bytes());
+        for k in 0..306u16 {
+            f.push(3);
+            f.push((k % 4) as u8);
+        }
+        let frame = parse_adr018(&f).expect("306-subcarrier frame should parse");
+        assert_eq!(frame.n_subcarriers, 306);
+        assert_eq!(frame.rssi, -52);
+        assert_eq!(frame.iq_data.len(), 612);
+        assert_eq!(frame.amplitudes.len(), 306);
+    }
 }
