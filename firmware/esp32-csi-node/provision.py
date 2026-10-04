@@ -44,6 +44,7 @@ import csv
 import io
 import json
 import os
+import stat
 import struct
 import subprocess
 import sys
@@ -129,6 +130,84 @@ def _state_path_for(port: str, state_dir: str) -> str:
     return os.path.join(state_dir, f"{safe}.json")
 
 
+# State files hold the WiFi password and seed token in cleartext (#1754), so the
+# directory is owner-only and every file in it is 0600.
+STATE_DIR_MODE = 0o700
+STATE_FILE_MODE = 0o600
+
+# Values `--state` hides unless `--show-secrets` is passed (#1754).
+SECRET_ATTRS = ("password", "seed_token")
+
+
+def _restrict_mode(path: str, mode: int) -> None:
+    """chmod `path` to `mode` if it is a real file or dir owned by this user.
+
+    Never raises: a read-only or unusual filesystem must not block provisioning,
+    but a secret left readable by others is reported. Symlinks are not followed,
+    so a planted link can't redirect the chmod.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        print(f"WARNING: could not stat {path}: {exc}", file=sys.stderr)
+        return
+    if stat.S_ISLNK(st.st_mode):
+        print(f"WARNING: not changing permissions through symlink {path}", file=sys.stderr)
+        return
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        print(f"WARNING: {path} is not owned by you; permissions left unchanged",
+              file=sys.stderr)
+        return
+    if stat.S_IMODE(st.st_mode) == mode:
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        print(f"WARNING: could not set {oct(mode)} on {path}: {exc}", file=sys.stderr)
+
+
+def harden_state_dir(state_dir: str) -> None:
+    """Make the state dir 0700 and its state/temp files 0600.
+
+    Covers files written by earlier versions of this script, which used the
+    default umask (0755 dir, 0644 files). POSIX only: chmod can't set
+    owner-only ACLs on Windows.
+    """
+    if sys.platform == "win32" or not os.path.isdir(state_dir):
+        return
+    _restrict_mode(state_dir, STATE_DIR_MODE)
+    try:
+        names = os.listdir(state_dir)
+    except OSError:
+        return
+    for name in names:
+        if name.endswith((".json", ".tmp")):
+            _restrict_mode(os.path.join(state_dir, name), STATE_FILE_MODE)
+
+
+def _write_private(path: str, data: bytes) -> None:
+    """Write a credential-bearing file (state, NVS CSV or binary) as 0600."""
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    fd = os.open(path, flags, STATE_FILE_MODE)
+    with os.fdopen(fd, "wb") as f:
+        # O_CREAT ignores the mode when the file already exists.
+        if hasattr(os, "fchmod"):
+            os.fchmod(f.fileno(), STATE_FILE_MODE)
+        f.write(data)
+
+
+def redact_secrets(state: dict) -> dict:
+    """Copy of `state` with secret values replaced by a fixed marker."""
+    shown = dict(state)
+    for name in SECRET_ATTRS:
+        if shown.get(name) is not None:
+            shown[name] = "(set)" if shown[name] else "(empty)"
+    return shown
+
+
 def load_state(port: str, state_dir: str) -> dict:
     """Return the merged-state dict for `port`, or `{}` if absent / unreadable."""
     path = _state_path_for(port, state_dir)
@@ -145,15 +224,32 @@ def load_state(port: str, state_dir: str) -> dict:
 
 
 def save_state(port: str, state_dir: str, state: dict) -> str:
-    """Write `state` to the per-port file, creating dirs as needed. Returns path."""
-    os.makedirs(state_dir, exist_ok=True)
+    """Write `state` to the per-port file, creating dirs as needed. Returns path.
+
+    The file holds secrets, so it is written 0600 inside a 0700 dir (#1754).
+    """
+    os.makedirs(state_dir, mode=STATE_DIR_MODE, exist_ok=True)
+    harden_state_dir(state_dir)
     path = _state_path_for(port, state_dir)
-    # Sort keys for deterministic on-disk content (easier to diff).
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-        f.write("\n")
-    os.replace(tmp, path)
+    # mkstemp picks a unique name and opens it O_EXCL with mode 0600, so a
+    # stale temp file or a planted symlink can't receive the secret.
+    fd, tmp = tempfile.mkstemp(
+        dir=state_dir, prefix=os.path.basename(path) + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), STATE_FILE_MODE)
+            # Sort keys for deterministic on-disk content (easier to diff).
+            json.dump(state, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     return path
 
 
@@ -239,11 +335,12 @@ def build_nvs_csv(args):
 
 def generate_nvs_binary(csv_content, size):
     """Generate an NVS partition binary from CSV using nvs_partition_gen.py."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f_csv:
-        f_csv.write(csv_content)
-        csv_path = f_csv.name
-
-    bin_path = csv_path.replace(".csv", ".bin")
+    # Both files carry the WiFi password. A private 0700 dir keeps the
+    # generator's output (written with the default umask) away from other users.
+    work_dir = tempfile.mkdtemp(prefix="provision-nvs-")
+    csv_path = os.path.join(work_dir, "nvs.csv")
+    bin_path = os.path.join(work_dir, "nvs.bin")
+    _write_private(csv_path, csv_content.encode("utf-8"))
 
     try:
         # Method 1: subprocess invocation (most reliable across package versions)
@@ -282,6 +379,10 @@ def generate_nvs_binary(csv_content, size):
         for p in (csv_path, bin_path):
             if os.path.isfile(p):
                 os.unlink(p)
+        try:
+            os.rmdir(work_dir)
+        except OSError:
+            pass
 
 
 def flash_nvs(port, baud, nvs_bin, chip):
@@ -367,9 +468,16 @@ def main():
                         help="Override the per-user state directory (default: per-OS user config dir).")
     parser.add_argument("--state", action="store_true",
                         help="Print the merged state that WOULD be flashed for this port and exit. "
-                        "Useful for debugging which keys are about to land on the device.")
+                        "Useful for debugging which keys are about to land on the device. "
+                        "The WiFi password and seed token are shown as (set)/(empty).")
+    parser.add_argument("--show-secrets", action="store_true",
+                        help="With --state, print the WiFi password and seed token in clear.")
 
     args = parser.parse_args()
+
+    # State written by older versions may be 0644. Tighten it before any read
+    # or early exit (#1754).
+    harden_state_dir(args.state_dir)
 
     # --- Per-port state load + merge (additive-by-default, #391 / #574) ---
     if args.reset:
@@ -383,7 +491,10 @@ def main():
     merged = merge_state_into_args(args, prior)
 
     if args.state:
-        print(json.dumps(merged, indent=2, sort_keys=True))
+        shown = merged if args.show_secrets else redact_secrets(merged)
+        print(json.dumps(shown, indent=2, sort_keys=True))
+        if shown != merged:
+            print("Secrets hidden; pass --show-secrets to print them.", file=sys.stderr)
         return
 
     if not has_config_value(args):
@@ -487,8 +598,7 @@ def main():
         print(f"\nError generating NVS binary: {e}", file=sys.stderr)
         print("\nFallback: save CSV and flash manually with ESP-IDF tools.", file=sys.stderr)
         fallback_path = "nvs_config.csv"
-        with open(fallback_path, "w") as f:
-            f.write(csv_content)
+        _write_private(fallback_path, csv_content.encode("utf-8"))
         print(f"Saved NVS CSV to {fallback_path}", file=sys.stderr)
         print(f"Flash with: python $IDF_PATH/components/nvs_flash/"
               f"nvs_partition_generator/nvs_partition_gen.py generate "
@@ -497,8 +607,7 @@ def main():
 
     if args.dry_run:
         out = "nvs_provision.bin"
-        with open(out, "wb") as f:
-            f.write(nvs_bin)
+        _write_private(out, nvs_bin)
         print(f"NVS binary saved to {out} ({len(nvs_bin)} bytes)")
         print(f"Flash manually: python -m esptool --chip {args.chip} --port {args.port} "
               f"write_flash 0x9000 {out}")
