@@ -242,3 +242,142 @@ fn test_max_nodes_255() {
     // 255 unique node_ids — the HashMap should handle this fine
     let _ = 255; // loop completed without panic
 }
+
+// ── Issue #1894: live server, multi-node grid drift ─────────────────────────
+//
+// Boots the real binary on ephemeral ports (nothing shared with a server on
+// the default ports) and drives it over real UDP.
+
+struct LiveServer {
+    child: std::process::Child,
+    http: u16,
+    udp: u16,
+}
+
+impl Drop for LiveServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn free_tcp_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+    l.local_addr().unwrap().port()
+}
+
+fn free_udp_port() -> u16 {
+    let s = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral");
+    s.local_addr().unwrap().port()
+}
+
+impl LiveServer {
+    fn start() -> Self {
+        use std::io::Read;
+        for attempt in 1..=3 {
+            let (http, ws, udp) = (free_tcp_port(), free_tcp_port(), free_udp_port());
+            let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sensing-server"))
+                .args([
+                    "--http-port", &http.to_string(),
+                    "--ws-port", &ws.to_string(),
+                    "--udp-port", &udp.to_string(),
+                    "--bind-addr", "127.0.0.1",
+                    "--no-edge-registry",
+                    "--source", "esp32",
+                ])
+                .env_remove("RUVIEW_API_TOKEN")
+                .env_remove("RUVIEW_UDP_ALLOW")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn sensing-server");
+            // Generous: a debug build boots slowly on a loaded machine.
+            let deadline = std::time::Instant::now() + Duration::from_secs(90);
+            while std::time::Instant::now() < deadline {
+                if health(http).is_some() {
+                    return LiveServer { child, http, udp };
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // Kill first: reading stderr of a live child blocks until it exits.
+            let _ = child.kill();
+            let _ = child.wait();
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut err);
+            }
+            if err.contains("Address already in use") && attempt < 3 {
+                continue;
+            }
+            panic!("sensing-server did not become ready\n--- stderr ---\n{err}");
+        }
+        unreachable!()
+    }
+}
+
+/// `GET /health` over a raw socket; `None` until the listener answers.
+fn health(http: u16) -> Option<serde_json::Value> {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", http)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    s.write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .ok()?;
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).ok()?;
+    let body = resp.split("\r\n\r\n").nth(1)?;
+    serde_json::from_str(body).ok()
+}
+
+fn tick(h: &serde_json::Value) -> u64 {
+    h["tick"].as_u64().expect("health.tick")
+}
+
+/// Send `n_sub`-subcarrier frames from `nodes` at ~50 fps each for `dur`.
+fn stream(sock: &UdpSocket, udp: u16, nodes: &[u8], n_sub: u16, seq: &mut u32, dur: Duration) {
+    let end = std::time::Instant::now() + dur;
+    while std::time::Instant::now() < end {
+        for &nid in nodes {
+            let _ = sock.send_to(&build_csi_frame(nid, *seq, -50, n_sub), ("127.0.0.1", udp));
+        }
+        *seq = seq.wrapping_add(1);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Issue #1894: three nodes lock onto a 128-subcarrier grid, then their
+/// radios drop to 64 for good. Before the fix every later frame was rejected
+/// by the grid gate, so `tick` froze for the life of the process while
+/// `/health` kept answering `"status": "ok"`. The node must re-lock onto the
+/// grid it is actually sending, and `/health` must report input stopping.
+#[test]
+fn multi_node_grid_drift_does_not_freeze_processing() {
+    let server = LiveServer::start();
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind sender");
+    let nodes = [1u8, 2, 3];
+    let mut seq = 0u32;
+
+    stream(&sock, server.udp, &nodes, 128, &mut seq, Duration::from_millis(1500));
+    let h = health(server.http).expect("health after 128-bin phase");
+    let locked_tick = tick(&h);
+    assert!(locked_tick > 0, "128-bin frames must be processed: {h}");
+
+    // Radios switch to 64 bins and stay there. The gate re-locks once 64
+    // dominates its vote window; then processing must have resumed.
+    stream(&sock, server.udp, &nodes, 64, &mut seq, Duration::from_secs(7));
+    let before = tick(&health(server.http).expect("health mid-drift"));
+    stream(&sock, server.udp, &nodes, 64, &mut seq, Duration::from_secs(1));
+    let h = health(server.http).expect("health after drift");
+    assert!(
+        tick(&h) > before && before > locked_tick,
+        "tick froze after the grid change: locked={locked_tick} before={before} now={}",
+        tick(&h)
+    );
+    assert_eq!(h["processing"]["state"], "live", "{h}");
+
+    // Every node goes quiet: /health must say so rather than read healthy.
+    std::thread::sleep(Duration::from_secs(6));
+    let h = health(server.http).expect("health after silence");
+    assert_eq!(h["status"], "ok", "server itself is still up: {h}");
+    assert_eq!(h["processing"]["state"], "no_input", "{h}");
+    assert!(h["processing"]["udp"]["datagrams"].as_u64().unwrap_or(0) > 0, "{h}");
+}
