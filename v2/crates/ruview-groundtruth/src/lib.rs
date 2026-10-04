@@ -24,6 +24,10 @@
 //!              └─ to_evidence_record → ruview_evidence ledger
 //! ```
 //!
+//! Radar reference logs (one JSON summary per window) enter through
+//! [`RadarLabels`], which turns each window into presence, count and range
+//! labels with an uncertainty and a reason when a window cannot be labelled.
+//!
 //! ## Honesty and determinism
 //!
 //! - **Canonical vocabulary (ADR-300 rule 3):** the report speaks the
@@ -50,6 +54,7 @@ mod agreement;
 mod align;
 mod error;
 mod model;
+mod radar;
 mod scope;
 mod series;
 mod source;
@@ -60,6 +65,11 @@ pub use align::{
 };
 pub use error::{GroundTruthError, MAX_STR_LEN};
 pub use model::{DataProvenance, Measurand, Reading, ReadingKind};
+pub use radar::{
+    label_window, parse_radar_jsonl, LabelStatus, LabelUncertainty, PresenceBasis,
+    RadarAdapterConfig, RadarLabel, RadarLabels, RadarTarget, RadarWindow, RadarWindowSource,
+    UnknownReason, LABEL_ABSENT, LABEL_PRESENT, MAX_RADAR_LINE_BYTES, MAX_RADAR_TARGETS,
+};
 pub use scope::{DistanceBand, LineOfSight, MotionState, SessionScope, MAX_SUBJECTS};
 pub use series::{EstimateSeries, ReferenceObservation, ReferenceSeries, MAX_SAMPLES};
 pub use source::{ReferenceModality, ReferenceSource};
