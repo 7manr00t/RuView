@@ -122,6 +122,7 @@ members = [
     "crates/ruview-counterfactual",# ADR-313 counterfactual spatial inference
     "crates/ruview-infogain",      # ADR-314 information-gain scheduler
     "crates/ruview-active",        # ADR-309 active sensing control
+    "crates/ruview-survey",        # ADR-381 node self-survey (check mode)
     # ADR-324 — clean-room Kooima off-axis (head-coupled perspective) projection.
     # Dependency-free native core; wasm-bindgen surface only on wasm32.
     "crates/ruview-offaxis",
