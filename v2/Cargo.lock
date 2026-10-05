@@ -13387,6 +13387,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-http",
+ "wifi-densepose-hardware",
 ]
 
 [[package]]
