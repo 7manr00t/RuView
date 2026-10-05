@@ -116,7 +116,14 @@ def ensure_model(cache_dir: Path) -> Path:
 def load_api_token(token_file: str | None) -> str | None:
     """Bearer token for the sensing server: --token-file, else RUVIEW_API_TOKEN."""
     if token_file:
-        return Path(token_file).read_text(encoding="utf-8").strip() or None
+        try:
+            return Path(token_file).read_text(encoding="utf-8").strip() or None
+        except (OSError, UnicodeDecodeError) as exc:
+            print(
+                f"ERROR: cannot read --token-file {token_file!r}: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     return os.environ.get("RUVIEW_API_TOKEN", "").strip() or None
 
 
@@ -139,9 +146,24 @@ def post_json(
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read() or b"{}")
+            raw = resp.read() or b"{}"
     except Exception as exc:
         print(f"WARNING: POST {url} failed: {exc}", file=sys.stderr)
+        return False
+    try:
+        body = json.loads(raw)
+    except ValueError as exc:
+        print(
+            f"WARNING: POST {url} returned a non-JSON body: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    if not isinstance(body, dict):
+        print(
+            f"WARNING: POST {url} returned unexpected JSON "
+            f"({type(body).__name__}), expected an object",
+            file=sys.stderr,
+        )
         return False
     if body.get("success") is False:
         print(f"WARNING: POST {url} refused: {body.get('error')}", file=sys.stderr)

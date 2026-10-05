@@ -119,7 +119,10 @@ static esp_err_t ota_status_handler(httpd_req_t *req)
 
 /* Receive chunk for POST /ota. Static, not on the httpd task stack: handlers
  * run one at a time on the single httpd task, so one buffer is enough, and
- * 1 KB was a quarter of the default 4 KB stack (ADR-379). */
+ * 1 KB was a quarter of the default 4 KB stack (ADR-379).
+ * NOT reentrant: this shared buffer is safe only because a single httpd task
+ * serves requests. Do not use it from another task or a multi-threaded
+ * httpd configuration. */
 static char s_ota_rx_buf[1024];
 
 void ota_update_log_httpd_stack(const char *what)

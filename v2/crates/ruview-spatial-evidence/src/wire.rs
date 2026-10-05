@@ -44,6 +44,9 @@ pub enum EvidenceError {
     /// Line exceeds [`MAX_LINE_BYTES`].
     #[error("line is {0} bytes, max {MAX_LINE_BYTES}")]
     LineTooLong(usize),
+    /// `MEASURED` was requested without a non-empty reproducer id.
+    #[error("MEASURED proof requires a non-empty reproducer id")]
+    MissingReproducer,
 }
 
 type R = Result<(), EvidenceError>;

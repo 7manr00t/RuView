@@ -6,8 +6,18 @@
 //!
 //! An occupancy or count accuracy means little without the score of a model
 //! that ignores the CSI entirely. [`majority_baseline`] fits that model on the
-//! training side (majority occupancy class, mean person count) and scores it
+//! training side (majority occupancy class, median person count) and scores it
 //! on the test side. Report a model's numbers next to this baseline.
+//!
+//! Limits of what this baseline and split establish:
+//! - A session split does not give independence across rooms or days. Two
+//!   sessions recorded in the same room, or on the same day, share layout,
+//!   occupants and RF environment, so a model can still look better than it
+//!   would in a new room. Split by room or day when the claim needs it.
+//! - The labeller's empty-hold guard (`empty_hold_ms`) is a backward-looking
+//!   heuristic: it only suppresses an `Empty` label shortly after an occupied
+//!   one and cannot see a person who is present but stationary or out of the
+//!   radar's view.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -76,16 +86,19 @@ pub struct BaselineReport {
     pub majority_occupancy: Occupancy,
     /// Accuracy of always predicting the majority class on the test side.
     pub majority_accuracy: f64,
-    /// Mean training person count, when any training window has a count.
-    pub mean_count: Option<f64>,
-    /// Mean absolute error of predicting `mean_count` on test windows with a
+    /// Median training person count (mean of the two middle values for an even
+    /// number of windows), when any training window has a count. The median
+    /// minimises mean absolute error, so it is the strongest constant
+    /// predictor for [`BaselineReport::count_mae`].
+    pub median_count: Option<f64>,
+    /// Mean absolute error of predicting `median_count` on test windows with a
     /// count.
     pub count_mae: Option<f64>,
     /// Test windows with a count.
     pub count_test_windows: usize,
 }
 
-/// Fit and score the majority-class / mean-count baseline.
+/// Fit and score the majority-class / median-count baseline.
 ///
 /// # Errors
 /// [`GroundTruthError::InvalidSplit`] when either side is empty.
@@ -122,14 +135,13 @@ pub fn majority_baseline(
         .filter_map(|w| w.person_count)
         .map(f64::from)
         .collect();
-    let mean_count = (!train_counts.is_empty())
-        .then(|| train_counts.iter().sum::<f64>() / train_counts.len() as f64);
+    let median_count = median(&train_counts);
     let test_counts: Vec<f64> = test
         .iter()
         .filter_map(|w| w.person_count)
         .map(f64::from)
         .collect();
-    let count_mae = match mean_count {
+    let count_mae = match median_count {
         Some(m) if !test_counts.is_empty() => {
             Some(test_counts.iter().map(|c| (c - m).abs()).sum::<f64>() / test_counts.len() as f64)
         }
@@ -142,9 +154,25 @@ pub fn majority_baseline(
         test_class_counts,
         majority_occupancy,
         majority_accuracy: hits as f64 / test.len() as f64,
-        mean_count,
+        median_count,
         count_mae,
         count_test_windows: test_counts.len(),
+    })
+}
+
+/// Median of `values`; the mean of the two middle values when the length is
+/// even. `None` for an empty slice.
+fn median(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(f64::total_cmp);
+    let n = v.len();
+    Some(if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
     })
 }
 
@@ -155,6 +183,7 @@ mod tests {
 
     fn w(session: &str, i: i64, count: u32) -> LabelledWindow {
         LabelledWindow {
+            evidence: crate::agreement::EvidenceGrade::Claimed,
             session: session.into(),
             start_ms: i * 1000,
             end_ms: i * 1000 + 1000,
@@ -213,17 +242,31 @@ mod tests {
     #[test]
     fn baseline_matches_hand_computed_fixture() {
         let s = session_disjoint_split(&windows(), &["tue"]).unwrap();
-        // Train: mon [0,1,1,2] + wed [1,0] -> 4 occupied of 6, mean count 5/6.
+        // Train: mon [0,1,1,2] + wed [1,0] -> 4 occupied of 6, median count 1.
         // Test: tue [0,0,1] -> majority "occupied" is right once in three.
         let b = majority_baseline(&s.train, &s.test).unwrap();
         assert_eq!(b.majority_occupancy, Occupancy::Occupied);
         assert!((b.majority_accuracy - 1.0 / 3.0).abs() < 1e-12);
-        let m = 5.0 / 6.0;
-        assert!((b.mean_count.unwrap() - m).abs() < 1e-12);
-        let mae = (m + m + (1.0 - m)) / 3.0;
+        assert!((b.median_count.unwrap() - 1.0).abs() < 1e-12);
+        // Test tue [0,0,1] against a constant 1: errors 1, 1, 0.
+        let mae = 2.0 / 3.0;
         assert!((b.count_mae.unwrap() - mae).abs() < 1e-12);
         assert_eq!(b.count_test_windows, 3);
         assert_eq!(b.test_class_counts.get(&Occupancy::Empty), Some(&2));
+    }
+
+    #[test]
+    fn median_is_mae_optimal_and_handles_even_and_odd() {
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median(&[0.0, 0.0, 1.0, 9.0]), Some(0.5));
+        // Skewed train set: the mean (2.0) would score worse on MAE than the
+        // median (0.0) against test counts [0, 0, 0].
+        let train = vec![w("a", 0, 0), w("a", 1, 0), w("a", 2, 6)];
+        let test = vec![w("b", 0, 0), w("b", 1, 0), w("b", 2, 0)];
+        let b = majority_baseline(&train, &test).unwrap();
+        assert_eq!(b.median_count, Some(0.0));
+        assert_eq!(b.count_mae, Some(0.0));
     }
 
     #[test]
@@ -236,7 +279,7 @@ mod tests {
         let b = majority_baseline(&train, &test).unwrap();
         assert_eq!(b.majority_occupancy, Occupancy::Empty);
         assert_eq!(b.majority_accuracy, 1.0);
-        assert_eq!((b.mean_count, b.count_mae), (None, None));
+        assert_eq!((b.median_count, b.count_mae), (None, None));
         assert!(majority_baseline(&[], &test).is_err());
     }
 }

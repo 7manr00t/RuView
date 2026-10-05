@@ -229,6 +229,15 @@ pub struct TrainingStatus {
     pub patience_remaining: u32,
     pub eta_secs: Option<u64>,
     pub phase: String,
+    /// Where the training frames came from: `"recordings"`, `"live_buffer"`
+    /// (no dataset requested), or `"live_buffer_fallback"` (recordings were
+    /// requested but none could be loaded).
+    #[serde(default)]
+    pub data_source: String,
+    /// True when the run did NOT train on the requested recordings (it fell
+    /// back to the live frame buffer) even though `phase` may read `completed`.
+    #[serde(default)]
+    pub degraded: bool,
 }
 
 impl Default for TrainingStatus {
@@ -246,6 +255,8 @@ impl Default for TrainingStatus {
             patience_remaining: 0,
             eta_secs: None,
             phase: "idle".to_string(),
+            data_source: String::new(),
+            degraded: false,
         }
     }
 }
@@ -1135,9 +1146,25 @@ async fn run_training_job(
     }
 
     let mut frames = load_recording_frames(&crate::recordings_dir(&data_dir), &dataset_ids).await;
+    let mut data_source = "recordings";
+    let mut degraded = false;
     if frames.is_empty() {
-        info!("No recordings found for dataset_ids; falling back to live frame_history");
+        if dataset_ids.is_empty() {
+            info!("No dataset_ids given; training from live frame_history");
+            data_source = "live_buffer";
+        } else {
+            warn!(
+                "None of the requested recordings {dataset_ids:?} could be loaded;                  falling back to live frame_history (run marked degraded)"
+            );
+            data_source = "live_buffer_fallback";
+            degraded = true;
+        }
         frames = frames_from_history(&history_snapshot);
+    }
+    {
+        let mut st = status.lock().unwrap();
+        st.data_source = data_source.to_string();
+        st.degraded = degraded;
     }
 
     if frames.len() < 10 {
@@ -1418,6 +1445,8 @@ async fn run_training_job(
                 patience_remaining,
                 eta_secs: Some(eta_secs),
                 phase: phase.to_string(),
+                data_source: data_source.to_string(),
+                degraded,
             };
         }
 
@@ -1506,6 +1535,8 @@ async fn run_training_job(
                     "best_oks": best_pck * 0.88,
                     "best_val_loss": best_val_loss,
                     "simulated": false,
+                    "data_source": data_source,
+                    "degraded": degraded,
                     "n_train_samples": n_train,
                     "n_val_samples": n_val,
                     "n_features": n_feat,
@@ -1582,7 +1613,9 @@ async fn run_training_job(
         st.phase = completed_phase.to_string();
     }
 
-    info!("Real {training_type} training finished: phase={completed_phase}");
+    info!(
+        "Real {training_type} training finished: phase={completed_phase}          data_source={data_source} degraded={degraded}"
+    );
     written_rvf
 }
 
@@ -2572,6 +2605,41 @@ mod tests {
 
         // Keep the test hermetic — remove the artifact it wrote.
         let _ = std::fs::remove_file(&rvf_path);
+    }
+
+    /// A run that asked for recordings but fell back to the live buffer must be
+    /// flagged `degraded` (and say so in `data_source`) rather than looking like
+    /// a clean `completed` run.
+    #[tokio::test]
+    async fn training_job_marks_live_buffer_fallback_as_degraded() {
+        let history = synthetic_history(40, 56);
+        let (tx, _rx) = broadcast::channel::<String>(1024);
+        let status = Arc::new(Mutex::new(TrainingStatus::default()));
+        let config = TrainingConfig {
+            epochs: 2,
+            batch_size: 8,
+            warmup_epochs: 1,
+            early_stopping_patience: 10,
+            ..Default::default()
+        };
+        let rvf = run_training_job(
+            status.clone(),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            config,
+            vec!["no-such-recording".to_string()],
+            history,
+            "supervised",
+            PathBuf::from("data"),
+        )
+        .await;
+        let final_status = status.lock().unwrap().clone();
+        assert_eq!(final_status.phase, "completed");
+        assert!(final_status.degraded, "fallback run must be degraded");
+        assert_eq!(final_status.data_source, "live_buffer_fallback");
+        if let Some(p) = rvf {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// ADR-186 P4 (path safety): a `dataset_id` containing directory traversal

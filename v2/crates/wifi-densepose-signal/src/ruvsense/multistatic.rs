@@ -783,8 +783,12 @@ impl MultistaticFuser {
             return freq_coherence;
         };
         // Issue #1752: a placeholder phase vector would make the CIR describe
-        // a zero-phase spectrum, not the channel. Skip the blend.
-        if first_frame.phase_reference == PhaseReference::Unavailable {
+        // a zero-phase spectrum, not the channel. Skip the blend when ANY frame
+        // in the cohort has a placeholder phase, not just the first.
+        if node_frames
+            .iter()
+            .any(|f| f.phase_reference == PhaseReference::Unavailable)
+        {
             return freq_coherence;
         }
 
@@ -1958,5 +1962,18 @@ mod tests {
         let coh_on = on.fuse(&frames).unwrap().cross_node_coherence;
         let coh_off = off.fuse(&frames).unwrap().cross_node_coherence;
         assert_eq!(coh_on, coh_off, "no CIR blend from a placeholder phase vector");
+    }
+
+    #[test]
+    fn cir_gate_skips_when_later_frame_has_placeholder_phase() {
+        let on = MultistaticFuser::with_cir_canonical56();
+        let off = MultistaticFuser::new();
+        let frames = [
+            with_reference(make_node_frame(0, 1000, 56, 1.0), PhaseReference::NodeLocal),
+            with_reference(make_node_frame(1, 1001, 56, 1.2), PhaseReference::Unavailable),
+        ];
+        let coh_on = on.fuse(&frames).unwrap().cross_node_coherence;
+        let coh_off = off.fuse(&frames).unwrap().cross_node_coherence;
+        assert_eq!(coh_on, coh_off, "no CIR blend when any cohort frame lacks phase");
     }
 }

@@ -120,6 +120,8 @@ Until it is confirmed, the **next reset reverts to the previous slot** and
   120 s from boot), it logs `health check failed: <reason>, rolling back` and
   reboots into the previous slot. A crash or reset before confirmation is also
   a rollback.
+- A pass means only "reached the network and sent CSI". It does not show that
+  sensing, calibration, or any other function of the new image works.
 - `GET /ota/status` reports `ota_state`. `pending_verify` means the image is
   not yet durable. `valid` means it survives a power cycle. `new` after an OTA
   means this board's bootloader has **no** rollback support.

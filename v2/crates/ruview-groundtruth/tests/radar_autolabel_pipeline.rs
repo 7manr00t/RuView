@@ -62,6 +62,8 @@ fn synthetic_sessions_label_split_and_baseline() {
     assert!(all.iter().all(|w| w.csi.n_frames == 10));
     assert_eq!(all[3].person_count, Some(2));
     assert_eq!(all[0].occupancy, Occupancy::Empty);
+    // Radar-derived labels are never human ground truth.
+    assert!(all.iter().all(|w| w.evidence == ruview_groundtruth::EvidenceGrade::Claimed));
 
     let split = session_disjoint_split(&all, &["b"]).unwrap();
     let train: BTreeSet<_> = split.train.iter().map(|w| w.session.clone()).collect();
@@ -72,7 +74,8 @@ fn synthetic_sessions_label_split_and_baseline() {
     let b = majority_baseline(&split.train, &split.test).unwrap();
     assert_eq!(b.majority_occupancy, Occupancy::Occupied);
     assert!((b.majority_accuracy - 0.25).abs() < 1e-12);
-    assert!((b.mean_count.unwrap() - 6.0 / 8.0).abs() < 1e-12);
+    // Train a+c counts sorted: 0,0,0,1,1,1,1,2 -> median 1.
+    assert!((b.median_count.unwrap() - 1.0).abs() < 1e-12);
 
     // Same inputs, same outputs.
     let again = majority_baseline(&split.train, &split.test).unwrap();

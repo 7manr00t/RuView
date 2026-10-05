@@ -14,6 +14,11 @@ const MIN_UNCERTAINTY_M: f64 = 1e-3;
 const MAX_UNCERTAINTY_M: f64 = 100.0;
 
 /// Caller context for exporting Gaussians.
+///
+/// Build it with [`GaussianExport::new`], which defaults the proof tag to
+/// `CODE`. A non-synthetic record is `MEASURED` only when the caller also names
+/// a reproducer ([`GaussianExport::measured`]); asking for `MEASURED` without
+/// one is an error, so the tag cannot be raised by assertion alone.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GaussianExport {
     /// Urth region id the room frame belongs to.
@@ -23,6 +28,30 @@ pub struct GaussianExport {
     /// Strongest proof tag the caller claims. A Gaussian with synthetic
     /// RuView provenance is emitted as `SYNTHETIC` regardless.
     pub proof: ProofTag,
+    /// Id of the reproducer (script, capture or log) behind a `MEASURED` claim.
+    /// Required, non-blank, when `proof` is `MEASURED`. It is a gate only: v1
+    /// has no wire field for it, so it is not serialised.
+    pub reproducer: Option<String>,
+}
+
+impl GaussianExport {
+    /// Context with the default proof tag, `CODE`, and no reproducer.
+    pub fn new(region: impl Into<String>, producer: impl Into<String>) -> Self {
+        Self {
+            region: region.into(),
+            producer: producer.into(),
+            proof: ProofTag::Code,
+            reproducer: None,
+        }
+    }
+
+    /// Claim `MEASURED`, backed by the named reproducer.
+    #[must_use]
+    pub fn measured(mut self, reproducer: impl Into<String>) -> Self {
+        self.proof = ProofTag::Measured;
+        self.reproducer = Some(reproducer.into());
+        self
+    }
 }
 
 fn motion(m: MotionState) -> Motion {
@@ -51,6 +80,10 @@ pub fn gaussian_to_record(
     let source_id = sanitize_id(&g.provenance.device_id, FALLBACK_SOURCE);
     let proof = if g.provenance.synthetic {
         ProofTag::Synthetic
+    } else if ctx.proof == ProofTag::Measured
+        && ctx.reproducer.as_deref().map_or(true, |r| r.trim().is_empty())
+    {
+        return Err(EvidenceError::MissingReproducer);
     } else {
         ctx.proof
     };

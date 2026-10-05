@@ -2345,7 +2345,11 @@ mod privacy_mode_surface_tests {
     fn state(privacy_mode: bool) -> SharedState {
         let mut inner = AppStateInner::minimal();
         inner.privacy_mode = privacy_mode;
-        inner.latest_update = Some(update_with_biometrics());
+        let mut update = update_with_biometrics();
+        // Fresh stamp: `/sensing/latest` serves an update older than
+        // LATEST_UPDATE_STALE_AFTER as {"status":"stale"} (#2119).
+        update.timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        inner.latest_update = Some(update);
         Arc::new(RwLock::new(inner))
     }
 
@@ -5528,7 +5532,7 @@ mod issue_1004_source_plan_tests {
     // stand down for).
     #[test]
     fn explicit_mediatek_binds_udp_no_simulator() {
-        let plan = plan_source("mediatek", false, false);
+        let plan = plan_source("mediatek", false, false).expect("valid source");
         assert!(plan.bind_udp, "--source mediatek must receive MTC1 frames");
         assert!(
             !plan.run_simulator,
@@ -5536,19 +5540,6 @@ mod issue_1004_source_plan_tests {
         );
         assert!(!plan.run_wifi);
         assert_eq!(plan.initial_source, "mediatek");
-    }
-
-    // The bug `explicit_mediatek_binds_udp_no_simulator` guards against is
-    // general: any vendor name not explicitly matched still falls into the
-    // catch-all and binds nothing. Pinned here so the next vendor addition
-    // remembers to add its own arm rather than relying on this default.
-    #[test]
-    fn unmatched_vendor_name_still_binds_nothing_by_default() {
-        let plan = plan_source("qualcomm", false, false);
-        assert!(!plan.bind_udp);
-        assert!(!plan.run_simulator);
-        assert!(!plan.run_wifi);
-        assert_eq!(plan.initial_source, "qualcomm");
     }
 
     // Promotion check: the runtime promotes by setting `AppStateInner.source`
@@ -6123,6 +6114,8 @@ mod latest_update_staleness_tests {
                 values: vec![],
             },
             vital_signs: None,
+            classifier: None,
+            activity: None,
             calibrated_presence_evidence: None,
             enhanced_motion: None,
             enhanced_breathing: None,
@@ -11484,6 +11477,41 @@ mod processing_state_tests {
     }
 }
 
+/// Upper bound on distinct MediaTek `device_id`s tracked at once. `device_id`
+/// comes from untrusted UDP frames, so every per-device map must be bounded.
+const MAX_MEDIATEK_DEVICES: usize = 64;
+
+/// Upper bound accepted for `--csi-ring` (frames retained per device).
+const MAX_CSI_RING_CAPACITY: usize = 4096;
+
+/// Clamp the `--csi-ring` flag into `1..=MAX_CSI_RING_CAPACITY`.
+fn clamp_csi_ring(requested: usize) -> usize {
+    requested.clamp(1, MAX_CSI_RING_CAPACITY)
+}
+
+/// Make room for `device_id` in the per-device MediaTek maps. If it is a new
+/// device and the cap is reached, evict the oldest-updated device (by
+/// `mediatek_csi_by_device` stamp) from every per-device map.
+fn evict_mediatek_device_if_full(s: &mut AppStateInner, device_id: &str) {
+    if s.mediatek_csi_by_device.contains_key(device_id)
+        || s.mediatek_csi_by_device.len() < MAX_MEDIATEK_DEVICES
+    {
+        return;
+    }
+    let oldest = s
+        .mediatek_csi_by_device
+        .iter()
+        .min_by_key(|(_, (_, seen))| *seen)
+        .map(|(id, _)| id.clone());
+    if let Some(id) = oldest {
+        warn!("MediaTek device cap ({MAX_MEDIATEK_DEVICES}) reached; evicting {id}");
+        s.mediatek_csi_by_device.remove(&id);
+        s.mediatek_csi_ring_by_device.remove(&id);
+        s.mediatek_heuristic_by_device.remove(&id);
+        s.mediatek_activity_by_device.remove(&id);
+    }
+}
+
 /// Build the MediaTek-heuristic `SensingUpdate` from every currently-fresh
 /// device in `mediatek_csi_by_device` / `mediatek_heuristic_by_device`, after
 /// the caller has already folded the arriving frame's amplitude into its own
@@ -11770,6 +11798,38 @@ mod mediatek_room_update_tests {
     /// HOLD_DURATION, and CONFIRM_ABSENT_DURATION (all <= 10s) so confidence
     /// clears UNKNOWN_CONFIDENCE_THRESHOLD and hysteresis has settled.
     const SETTLE_SAMPLES: usize = 40;
+
+    #[test]
+    fn device_cap_evicts_oldest_updated_device() {
+        let mut s = AppStateInner::minimal();
+        let start = std::time::Instant::now();
+        for i in 0..MAX_MEDIATEK_DEVICES {
+            let id = format!("{:016x}", i + 1);
+            // Device 1 is the oldest; later ids are progressively newer.
+            let t = start + Duration::from_millis(i as u64);
+            seed_device(&mut s, &id, t, &[1.0], -50);
+            s.mediatek_activity_by_device
+                .insert(id, mediatek_activity::ActivityTracker::default());
+        }
+        let oldest = format!("{:016x}", 1);
+        // Existing device: no eviction.
+        evict_mediatek_device_if_full(&mut s, &oldest);
+        assert_eq!(s.mediatek_csi_by_device.len(), MAX_MEDIATEK_DEVICES);
+        // New device at the cap: oldest goes, from every map.
+        evict_mediatek_device_if_full(&mut s, "ffffffffffffffff");
+        assert_eq!(s.mediatek_csi_by_device.len(), MAX_MEDIATEK_DEVICES - 1);
+        assert!(!s.mediatek_csi_by_device.contains_key(&oldest));
+        assert!(!s.mediatek_heuristic_by_device.contains_key(&oldest));
+        assert!(!s.mediatek_activity_by_device.contains_key(&oldest));
+        assert!(!s.mediatek_csi_ring_by_device.contains_key(&oldest));
+    }
+
+    #[test]
+    fn csi_ring_is_clamped() {
+        assert_eq!(clamp_csi_ring(0), 1);
+        assert_eq!(clamp_csi_ring(256), 256);
+        assert_eq!(clamp_csi_ring(usize::MAX), MAX_CSI_RING_CAPACITY);
+    }
 
     #[test]
     fn empty_room_flat_amplitudes_is_absent() {
@@ -12215,6 +12275,7 @@ async fn udp_receiver_task(
                             let mut s = state.write().await;
                             s.source = source_label.clone();
                             s.last_mediatek_frame = Some(now);
+                            evict_mediatek_device_if_full(&mut s, &device_id);
                             s.mediatek_csi_by_device
                                 .insert(device_id.clone(), (snapshot.clone(), now));
                             s.latest_mediatek_csi = Some(snapshot);
@@ -14567,7 +14628,7 @@ async fn main() {
         mediatek_csi_by_device: HashMap::new(),
         mediatek_heuristic_by_device: HashMap::new(),
         mediatek_csi_ring_by_device: HashMap::new(),
-        csi_ring_capacity: args.csi_ring,
+        csi_ring_capacity: clamp_csi_ring(args.csi_ring),
         mediatek_activity_by_device: HashMap::new(),
         activity_floor_seed,
         room_activity_peak_history: std::collections::VecDeque::new(),

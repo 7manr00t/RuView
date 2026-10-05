@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agreement::EvidenceGrade;
 use crate::error::{check_bound, check_nonempty, GroundTruthError};
 use crate::radar::{LabelStatus, RadarLabels, UnknownReason};
 use crate::series::MAX_SAMPLES;
@@ -146,9 +147,19 @@ fn summarize(frames: &[CsiFrame]) -> CsiWindowSummary {
     }
 }
 
+fn claimed() -> EvidenceGrade {
+    EvidenceGrade::Claimed
+}
+
 /// One labelled window of a recording.
+///
+/// The label comes from a radar, not a human, so `evidence` is always
+/// [`EvidenceGrade::Claimed`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LabelledWindow {
+    /// Always [`EvidenceGrade::Claimed`] (radar-derived, not human ground truth).
+    #[serde(default = "claimed")]
+    pub evidence: EvidenceGrade,
     /// Session (recording) name; the unit of a disjoint split.
     pub session: String,
     /// Window start on the recording clock, Unix milliseconds.
@@ -294,6 +305,7 @@ pub fn auto_label(
         }
 
         out.windows.push(LabelledWindow {
+            evidence: l.evidence,
             session: session.to_owned(),
             start_ms: start,
             end_ms: end,

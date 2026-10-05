@@ -45,6 +45,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::agreement::EvidenceGrade;
 use crate::error::{check_bound, GroundTruthError};
 use crate::model::Measurand;
 use crate::series::{ReferenceObservation, ReferenceSeries, MAX_SAMPLES};
@@ -273,9 +274,22 @@ pub enum PresenceBasis {
     TargetCount,
 }
 
+fn claimed() -> EvidenceGrade {
+    EvidenceGrade::Claimed
+}
+
 /// One radar window turned into reference labels.
+///
+/// Radar labels are **not** human ground truth: a tracker misses stationary
+/// people and can ghost on clutter, and its range sigma is a datasheet figure.
+/// Every label therefore carries [`EvidenceGrade::Claimed`] in `evidence`; it
+/// is never `Measured` until a labeller checks it against an independent
+/// human count.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RadarLabel {
+    /// Always [`EvidenceGrade::Claimed`] (radar-derived, not human-verified).
+    #[serde(default = "claimed")]
+    pub evidence: EvidenceGrade,
     /// Label time, Unix milliseconds (window midpoint, see
     /// [`RadarWindow::label_time_ms`]).
     pub at_unix_ms: i64,
@@ -302,6 +316,7 @@ pub struct RadarLabel {
 impl RadarLabel {
     fn unknown(w: &RadarWindow, index: usize, reason: UnknownReason) -> Self {
         Self {
+            evidence: EvidenceGrade::Claimed,
             at_unix_ms: w.label_time_ms(),
             window_start_ms: w.window_start_ms.unwrap_or(w.timestamp_ms),
             window_end_ms: w.timestamp_ms,
@@ -377,6 +392,7 @@ pub fn label_window(w: &RadarWindow, index: usize, cfg: &RadarAdapterConfig) -> 
         });
 
     RadarLabel {
+        evidence: EvidenceGrade::Claimed,
         at_unix_ms: w.label_time_ms(),
         window_start_ms: w.window_start_ms.unwrap_or(w.timestamp_ms),
         window_end_ms: w.timestamp_ms,

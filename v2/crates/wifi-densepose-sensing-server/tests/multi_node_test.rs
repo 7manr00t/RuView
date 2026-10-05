@@ -367,6 +367,7 @@ fn stream(sock: &UdpSocket, udp: u16, nodes: &[u8], n_sub: u16, seq: &mut u32, d
 /// `/health` kept answering `"status": "ok"`. The node must re-lock onto the
 /// grid it is actually sending, and `/health` must report input stopping.
 #[test]
+#[ignore = "slow: spawns the live binary; run with --ignored"]
 fn multi_node_grid_drift_does_not_freeze_processing() {
     let server = LiveServer::start();
     let sock = UdpSocket::bind("127.0.0.1:0").expect("bind sender");

@@ -113,9 +113,11 @@ if [ "${1#-}" != "$1" ] || [ -z "$1" ]; then
     # (RUVIEW_UDP_ALLOW or RUVIEW_UDP_INSECURE_LAN); without one the server
     # would refuse a routable bind, so we keep loopback and say why instead.
     # An explicit RUVIEW_UDP_BIND or --udp-bind always wins.
-    case "${RUVIEW_UDP_INSECURE_LAN:-}" in
-        1|yes|YES|on|ON|TRUE|True) export RUVIEW_UDP_INSECURE_LAN=true ;;
-        0|no|NO|off|OFF|FALSE|False) export RUVIEW_UDP_INSECURE_LAN=false ;;
+    # The binary parses RUVIEW_UDP_INSECURE_LAN itself (1/yes/on/true, any
+    # case); here we only need to know whether it is truthy to pick the bind.
+    __insecure_lan=0
+    case "$(printf '%s' "${RUVIEW_UDP_INSECURE_LAN:-}" | tr 'A-Z' 'a-z')" in
+        1|true|yes|on) __insecure_lan=1 ;;
     esac
     __udp_bind_arg=0
     __udp_guard_arg=0
@@ -126,7 +128,7 @@ if [ "${1#-}" != "$1" ] || [ -z "$1" ]; then
         esac
     done
     if [ -z "${RUVIEW_UDP_BIND:-}" ] && [ "$__udp_bind_arg" = 0 ]; then
-        if [ -n "${RUVIEW_UDP_ALLOW:-}" ] || [ "${RUVIEW_UDP_INSECURE_LAN:-}" = true ] \
+        if [ -n "${RUVIEW_UDP_ALLOW:-}" ] || [ "$__insecure_lan" = 1 ] \
             || [ "$__udp_guard_arg" = 1 ]; then
             export RUVIEW_UDP_BIND=0.0.0.0
             echo "[entrypoint] UDP CSI receiver: binding 0.0.0.0 inside the container" >&2

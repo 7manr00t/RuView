@@ -101,7 +101,8 @@ Writing only offset `0x20000` is safe only when the status endpoint reports
 
 After an OTA, the same endpoint's `ota_state` must read `valid` before you
 power-cycle the node or push again. `pending_verify` means the image has not
-passed its first-boot health check yet and would revert on reset. See
+passed its first-boot health check yet and would revert on reset. A passed
+check means only that the node reached the network and sent CSI. See
 [RUNBOOK §2.1](RUNBOOK.md) and ADR-379.
 
 The full bundles do not include NVS, so the documented four-offset install

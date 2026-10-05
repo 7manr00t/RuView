@@ -9,7 +9,7 @@
 //!
 //! Writes one labelled window per line (to `--out`, or stdout) and a JSON
 //! summary to stderr: per-session kept/skipped counts and, when
-//! `--test-session` is given, the session-disjoint majority/mean baseline.
+//! `--test-session` is given, the session-disjoint majority/median baseline.
 //! `--offset-ms` is the recording clock minus the radar clock and applies to
 //! every session. `--allow-unverified` accepts radar windows whose source is
 //! not flagged as verified hardware.

@@ -261,6 +261,10 @@ impl Esp32CsiParser {
         // channel, issue #1005). Larger counts come from merged LLTF/HT-LTF
         // buffers (e.g. 192 = 3 x 64, 306) on 20/40 MHz channels; ESP32-family
         // radios do not use 80/160 MHz, so anything above 64 maps to 40 MHz.
+        //
+        // CLAIMED: the "HT/legacy count above 64 means 40 MHz" rule is inferred
+        // from the datasheet, not measured on these frames. ESP32-C5/C6 are not
+        // separately covered by it.
         let bandwidth = if ppdu_type.is_he() {
             if adr018_flags.bw40 || n_subcarriers > 256 {
                 Bandwidth::Bw40

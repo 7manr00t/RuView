@@ -165,7 +165,7 @@ When the build has no `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (the 8 MB S3 and
   16 MB, rollback bootloader, OTA key provisioned). The
   build from this branch was first written over USB. The pushes were made from
   a Pi 5 with the `sensor-ota-push` cog.
-  1. Positive. An image built from this branch was pushed to `ota_1`: HTTP 200,
+  1. Positive (MEASURED, S3). An image built from this branch was pushed to `ota_1`: HTTP 200,
      1,230,848 B in 22 s.
      - The node logged "httpd stack after POST /ota: 4900 of 8192 bytes never
        used", so the upload's peak stack use is about 3.3 KB. With the old 1 KB
@@ -175,7 +175,7 @@ When the build has no `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (the 8 MB S3 and
      - `/ota/status` then read `ota_state: valid`.
      - After a hard reset it came back on the same build in `ota_1`, still
        `valid`, so the update is durable.
-  2. Negative. A `CONFIG_OTA_HEALTH_FORCE_FAIL=y` build was pushed to `ota_0`:
+  2. Negative (MEASURED, S3 forced-fail rollback). A `CONFIG_OTA_HEALTH_FORCE_FAIL=y` build was pushed to `ota_0`:
      HTTP 200.
      - `/ota/status` showed it running as `pending_verify` for about 30 s.
      - The node then rebooted and came back on the previous build in `ota_1`,
@@ -184,12 +184,16 @@ When the build has no `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE` (the 8 MB S3 and
      node's USB-Serial-JTAG port at the same moment. The node reset and was
      unharmed. Don't hold the USB console open while pushing OTA to a
      USB-attached node.
-- C6, MEASURED on 2026-09-29 on node 5 (ESP32-C6, 8 MB
+- C6 positive, MEASURED on 2026-09-29 on node 5 (ESP32-C6, 8 MB
   flash, 4 MB layout, rollback bootloader).
   - The branch build was first written over USB and the OTA key provisioned.
   - A second build was pushed from the Pi 5 cog to `ota_1`: HTTP 200 in 11 s.
   - `/ota/status` showed `pending_verify`, then `valid` about 28 s later.
   - After a hard reset it stayed on the new build, `valid`.
-- Not yet verified: the 120 s no-IP timeout path; a real power-cycle (a hard
-  reset via RTS was used instead); the rollback test on the C6 (run on the S3
-  only).
+- Not yet verified, so CLAIMED (no log supports these):
+  - the 120 s no-IP timeout path (CLAIMED);
+  - a true power cycle (CLAIMED; a hard reset via RTS was used instead);
+  - the C6 negative/rollback test (CLAIMED; run on the S3 only).
+- A pass of this check means only that the node reached the network and sent
+  CSI. It does not validate sensing quality, calibration, or anything else the
+  image does.

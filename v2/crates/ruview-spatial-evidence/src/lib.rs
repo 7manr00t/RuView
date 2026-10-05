@@ -21,7 +21,17 @@
 //! Each record carries `provenance.proof` (`MEASURED` / `CODE` /
 //! `SYNTHETIC`). A Gaussian whose RuView provenance says `synthetic` is
 //! always emitted as `SYNTHETIC`, whatever the caller asks for; the tag can
-//! be lowered by the caller, never raised.
+//! be lowered by the caller, never raised. The default tag is `CODE`
+//! ([`GaussianExport::new`]); `MEASURED` needs a non-empty reproducer id
+//! ([`GaussianExport::measured`]) or the export fails with
+//! [`EvidenceError::MissingReproducer`]. The link path still takes the proof
+//! tag from the caller's [`RecordMeta`] unchecked.
+//!
+//! ## Golden fixtures
+//!
+//! The golden lines in `tests/evidence.rs` are copied from WeftOS ADR-107 §7.
+//! Origin: WeftOS ADR-107 contract, no in-repo spec beyond ADR-382's summary
+//! of it.
 
 pub mod gaussian;
 pub mod link;

@@ -79,7 +79,41 @@ fn export(proof: ProofTag) -> GaussianExport {
         region: REGION.into(),
         producer: "ruview-unified@0.3".into(),
         proof,
+        reproducer: Some("test-repro".into()),
     }
+}
+
+#[test]
+fn export_defaults_to_code() {
+    let ctx = GaussianExport::new(REGION, "ruview-unified@0.3");
+    assert_eq!(ctx.proof, ProofTag::Code);
+    let rec = gaussian_to_record(&gaussian("esp32-node-1", false), 0, &ctx).unwrap();
+    assert_eq!(rec.provenance.proof, ProofTag::Code);
+}
+
+#[test]
+fn measured_requires_a_non_empty_reproducer() {
+    let g = gaussian("esp32-node-1", false);
+    let mut ctx = GaussianExport::new(REGION, "p@0.1");
+    ctx.proof = ProofTag::Measured;
+    for bad in [None, Some(String::new()), Some("  ".to_string())] {
+        ctx.reproducer = bad;
+        assert_eq!(
+            gaussian_to_record(&g, 0, &ctx),
+            Err(EvidenceError::MissingReproducer)
+        );
+    }
+    let ok = gaussian_to_record(&g, 0, &GaussianExport::new(REGION, "p@0.1").measured("run-42"))
+        .unwrap();
+    assert_eq!(ok.provenance.proof, ProofTag::Measured);
+}
+
+#[test]
+fn synthetic_gaussian_needs_no_reproducer() {
+    let mut ctx = GaussianExport::new(REGION, "p@0.1");
+    ctx.proof = ProofTag::Measured;
+    let rec = gaussian_to_record(&gaussian("sim", true), 0, &ctx).unwrap();
+    assert_eq!(rec.provenance.proof, ProofTag::Synthetic);
 }
 
 #[test]

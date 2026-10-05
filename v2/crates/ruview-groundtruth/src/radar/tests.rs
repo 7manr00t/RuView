@@ -315,3 +315,19 @@ fn labels_are_deterministic() {
     w.targets = vec![RadarTarget { x_m: 0.3, y_m: 0.4 }];
     assert_eq!(label_window(&w, 0, &cfg()), label_window(&w, 0, &cfg()));
 }
+
+#[test]
+fn radar_labels_are_claimed_never_measured() {
+    use crate::agreement::EvidenceGrade;
+    let mut present = win(0);
+    present.target_count = Some(1);
+    let unknown = win(1000); // no observation -> Unknown
+    for w in [present, unknown] {
+        assert_eq!(label_window(&w, 0, &cfg()).evidence, EvidenceGrade::Claimed);
+    }
+    // A label deserialised from older JSON without the field is also Claimed.
+    let mut v = serde_json::to_value(label_window(&win(0), 0, &cfg())).unwrap();
+    v.as_object_mut().unwrap().remove("evidence");
+    let back: RadarLabel = serde_json::from_value(v).unwrap();
+    assert_eq!(back.evidence, EvidenceGrade::Claimed);
+}
