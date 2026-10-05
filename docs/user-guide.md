@@ -21,6 +21,7 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
    - [Windows WiFi (RSSI Only)](#windows-wifi-rssi-only)
    - [ESP32-S3 (Full CSI)](#esp32-s3-full-csi)
    - [ESP32 Multistatic Mesh (Advanced)](#esp32-multistatic-mesh-advanced)
+   - [MediaTek Router CSI (Experimental)](#mediatek-router-csi-experimental)
    - [Connect Mesh Data to the Dashboard and Observatory](#connect-mesh-data-to-the-dashboard-and-observatory)
    - [Cognitum Spaces activation](#cognitum-spaces-activation)
    - [Cognitum Seed Integration (ADR-069)](#cognitum-seed-integration-adr-069)
@@ -109,7 +110,7 @@ Multi-architecture image (amd64 + arm64). Works on Intel/AMD and Apple Silicon M
 | `simulated` | Generate synthetic CSI frames (no hardware required) |
 | `wifi` | Host Wi-Fi RSSI (not available inside containers) |
 
-Example: `docker run -e CSI_SOURCE=esp32 -p 3000:3000 -p 5005:5005/udp ruvnet/wifi-densepose:latest`
+Example: `docker run -e RUVIEW_API_TOKEN -e CSI_SOURCE=esp32 -e RUVIEW_UDP_ALLOW=<node-ip-or-cidr> -p 127.0.0.1:3000:3000 -p 5005:5005/udp ruvnet/wifi-densepose:latest`. The container exits with code 64 unless `RUVIEW_API_TOKEN` is set, and receives no ESP32 frames until a UDP source guard is set; see [Receiving ESP32 frames in Docker](#receiving-esp32-frames-in-docker).
 
 ### From Source (Rust)
 
@@ -261,8 +262,9 @@ Non-interactive:
 ### 30-Second Demo (Docker)
 
 ```bash
-# Pull and run
-docker run -p 3000:3000 -p 3001:3001 ruvnet/wifi-densepose:latest
+# Pull and run (the container exits with code 64 without an API token)
+export RUVIEW_API_TOKEN=$(openssl rand -hex 32)
+docker run -p 127.0.0.1:3000:3000 -p 127.0.0.1:3001:3001 -e RUVIEW_API_TOKEN ruvnet/wifi-densepose:latest
 
 # Open the UI in your browser
 # http://localhost:3000
@@ -302,7 +304,11 @@ All endpoints return JSON. In simulated mode, data is generated from a determini
 
 ## Data Sources
 
-The `--source` flag controls where CSI data comes from.
+The `--source` flag controls where CSI data comes from. Valid values are
+`auto`, `esp32`, `wifi`, and `simulated` (alias `simulate`), plus the vendor
+feeds `mediatek`, `qualcomm`, `realtek` (RTL8720F radar), and `realtek_csi`
+(RTL8721Dx CSI), which bind the UDP receiver like `esp32`. Any other value
+stops the server at startup with an error that lists them.
 
 ### Simulated Mode (No Hardware)
 
@@ -335,26 +341,24 @@ docker run --network host ruvnet/wifi-densepose:latest --source wifi --tick-ms 5
 
 ### macOS WiFi (RSSI Only)
 
-Uses CoreWLAN via a Swift helper binary. macOS Sonoma 14.4+ redacts real BSSIDs; the adapter generates deterministic synthetic MACs so the multi-BSSID pipeline still works.
+Uses CoreWLAN via a Swift helper binary. macOS Sonoma 14.4+ redacts real BSSIDs; the adapter generates deterministic synthetic MACs so the multi-BSSID pipeline still works. On macOS, `--source wifi` selects the CoreWLAN scanner; there is no separate `macos` value.
 
 ```bash
 # Compile the Swift helper (once)
 swiftc -O archive/v1/src/sensing/mac_wifi.swift -o mac_wifi
 
 # Run natively
-./target/release/sensing-server --source macos --http-port 3000 --ws-port 3001 --tick-ms 500
+./target/release/sensing-server --source wifi --http-port 3000 --ws-port 3001 --tick-ms 500
 ```
 
 See [ADR-025](adr/ADR-025-macos-corewlan-wifi-sensing.md) for details.
 
 ### Linux WiFi (RSSI Only)
 
-Uses `iw dev <iface> scan` to capture RSSI. Requires `CAP_NET_ADMIN` (root) for active scans; use `scan dump` for cached results without root.
-
-```bash
-# Run natively (requires root for active scanning)
-sudo ./target/release/sensing-server --source linux --http-port 3000 --ws-port 3001 --tick-ms 500
-```
+The sensing server does not have a Linux RSSI source yet. `--source wifi`
+on Linux runs the Windows `netsh` scanner, which is not present there, and
+`--source linux` is rejected at startup. Use an ESP32 node (`--source esp32`)
+on Linux.
 
 ### ESP32-S3 (Full CSI)
 
@@ -365,10 +369,38 @@ Real Channel State Information at 20 Hz with 56-192 subcarriers. Required for po
 ./target/release/sensing-server --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001
 
 # Docker (use CSI_SOURCE environment variable)
-docker run -p 3000:3000 -p 3001:3001 -p 5005:5005/udp -e CSI_SOURCE=esp32 ruvnet/wifi-densepose:latest
+docker run -p 127.0.0.1:3000:3000 -p 127.0.0.1:3001:3001 -p 5005:5005/udp \
+  -e RUVIEW_API_TOKEN -e CSI_SOURCE=esp32 -e RUVIEW_UDP_ALLOW=<node-ip-or-cidr> \
+  ruvnet/wifi-densepose:latest
 ```
 
 The ESP32 nodes stream binary CSI frames over UDP to port 5005. See [Hardware Setup](#esp32-s3-mesh) for flashing instructions.
+
+#### Receiving ESP32 frames in Docker
+
+The sensing server binds its UDP receiver to `127.0.0.1` by default (ADR-296). Inside a container that address cannot receive anything from a published `5005/udp` port, so no node ever appears. The image's entrypoint binds UDP on `0.0.0.0` only when you set a source guard, and prints a note at startup when you have not:
+
+| Variable | Effect |
+|----------|--------|
+| `RUVIEW_API_TOKEN` | Required. Without it (or `RUVIEW_ALLOW_UNAUTHENTICATED=1`) the container exits with code 64. |
+| `RUVIEW_UDP_ALLOW=<ip-or-cidr>` | Accept frames only from these sources. Preferred. |
+| `RUVIEW_UDP_INSECURE_LAN=true` | Accept frames from any source. The UDP data plane is not authenticated, so only use this on a trusted network. |
+| `RUVIEW_UDP_BIND` | Explicit UDP bind address. Overrides the entrypoint's choice. |
+| `SENSING_ALLOWED_HOSTS=<host-ip>` | Needed to open the UI from another machine; otherwise the server answers 421. That also requires publishing the TCP ports beyond `127.0.0.1`. |
+
+**macOS (Docker Desktop, OrbStack):** datagrams reach the container from the Docker bridge gateway, not from the node's LAN address, so an allowlist that names your LAN subnet drops every frame. Allow the gateway instead:
+
+```bash
+export RUVIEW_API_TOKEN=$(openssl rand -hex 32)
+GW=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+docker run --rm -d --name ruview \
+  -p 127.0.0.1:3000:3000 -p 127.0.0.1:3001:3001 -p 5005:5005/udp \
+  -e RUVIEW_API_TOKEN -e CSI_SOURCE=esp32 -e RUVIEW_UDP_ALLOW="$GW/32" \
+  ruvnet/wifi-densepose:latest
+curl -s -H "Authorization: Bearer $RUVIEW_API_TOKEN" localhost:3000/api/v1/nodes
+```
+
+Allowing the gateway admits anything that can reach the published port, so keep `5005/udp` off untrusted networks. Node identity still comes from the frame payload. With Docker Compose the service runs on the project network (`<project>_default`), so inspect that network's gateway rather than `bridge`. Docker Desktop on Windows has a related source-address problem; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ### ESP32 Multistatic Mesh (Advanced)
 
@@ -391,6 +423,16 @@ The mesh uses a **Time-Division Multiplexing (TDM)** protocol so nodes take turn
 
 See [ADR-029](adr/ADR-029-ruvsense-multistatic-sensing-mode.md) and [ADR-032](adr/ADR-032-multistatic-mesh-security-hardening.md) for the full design.
 
+### MediaTek Router CSI (Experimental)
+
+An OpenWrt router with an MT7981B + MT7976C radio (tested on a Wavlink WL-WN586X3 Rev A) can report CSI through MediaTek's vendor CSI patch. A host-side bridge converts it to MTC1 (ADR-267) for the sensing server:
+
+```bash
+./target/release/sensing-server --source mediatek --udp-port 5005 --http-port 3000 --ws-port 3001
+```
+
+Frames are labelled `mediatek:physical-unvalidated`. The presence and activity outputs on this source are uncalibrated heuristics with no sensing-quality validation. CSI exists only while associated clients transmit. See the [MediaTek Router CSI guide](mediatek-router-csi.md) for the OpenWrt build, arming CSI, the bridge, and limitations.
+
 ### Connect Mesh Data to the Dashboard and Observatory
 
 If a standalone `aggregator` command prints live packets, the ESP32 fleet is already reaching that host. To visualize the same data, stop the standalone aggregator and run `sensing-server` on that same host and UDP port. The sensing server is the aggregator used by the REST API, WebSocket stream, dashboard, and Observatory.
@@ -407,12 +449,16 @@ cargo run -p wifi-densepose-sensing-server -- \
 
 # Docker
 docker run --rm \
+  -e RUVIEW_API_TOKEN \
   -e CSI_SOURCE=esp32 \
-  -p 3000:3000 \
-  -p 3001:3001 \
+  -e RUVIEW_UDP_ALLOW=<node-ip-or-cidr> \
+  -p 127.0.0.1:3000:3000 \
+  -p 127.0.0.1:3001:3001 \
   -p 5005:5005/udp \
   ruvnet/wifi-densepose:latest
 ```
+
+On macOS Docker the allowlist must name the bridge gateway; see [Receiving ESP32 frames in Docker](#receiving-esp32-frames-in-docker).
 
 Open the UI from the sensing server, not from a local file:
 
@@ -425,9 +471,19 @@ Use these checks before debugging the browser:
 
 ```bash
 curl http://localhost:3000/health
+curl http://localhost:3000/api/v1/status
 curl http://localhost:3000/api/v1/nodes
 curl http://localhost:3000/api/v1/sensing/latest
 ```
+
+`/api/v1/status` reports whether frames are actually arriving:
+
+| `source_state` | Meaning |
+|---|---|
+| `disconnected` | A live source is configured but no frame has arrived yet. `waiting_for_frames` is `true` and `last_frame_age_ms` is `null`. |
+| `live_unverified` | Frames are arriving. `last_frame_age_ms` is under 5000. |
+| `stale` | Frames arrived, then stopped for more than 5 seconds. For a hardware source, `source` gains an `:offline` suffix (for example `esp32:offline`). |
+| `synthetic` | Simulated data. Never shown as live. |
 
 If the ESP32 nodes are provisioned with `--target-ip <AGGREGATOR_HOST>`, that IP must be the machine running `sensing-server`. Only one process can receive UDP `:5005` at a time, so leave the standalone hardware `aggregator` off while the dashboard or Observatory is live.
 
@@ -586,6 +642,8 @@ Base URL: `http://localhost:3000` (Docker) or `http://localhost:8080` (binary de
 | `GET` | `/api/v1/nodes/:id/sync` | Single-node mesh sync snapshot (or 404) | `{"offset_us":1163565,"is_leader":false,...}` |
 | `GET` | `/api/v1/mesh/metrics` | ADR-110 mesh state in Prometheus exposition format ([iter 36](adr/ADR-110-esp32-c6-firmware-extension.md)) | `wifi_densepose_mesh_offset_us{node="9"} 1163565\n…` |
 | `GET` | `/api/field` | ADR-262 P3 — latest **signed RuField `FieldEvent`s** from the live sensing cycle, plus the signer pubkey + a `dev_signing_key` flag. Only egress-safe (P1/P2) events are surfaced; identity/biometric (P4/P5) and raw (P0) are held edge-local | `{"spec":"rufield","signer_pubkey_hex":"…","dev_signing_key":true,"events":[…]}` |
+
+Recording and model files live under the server's `--data-dir` (env `RUVIEW_DATA_DIR`, default `data`, resolved against the directory the server was started from): recordings in `<data-dir>/recordings/`, `.rvf` models in `<data-dir>/models/` unless `MODELS_DIR` is set, and the adaptive classifier in `<data-dir>/adaptive_model.json`.
 
 ### RuField surface (ADR-262 P3)
 
@@ -843,7 +901,14 @@ Full design + operator guide: [`docs/integrations/home-assistant.md`](integratio
 sensing-server --mqtt --mqtt-host <broker> --mqtt-tls --privacy-mode
 ```
 
-`--privacy-mode` strips heart rate, breathing rate, and pose keypoints from MQTT **and** Matter — they never reach the wire. Semantic primitives stay published because they're inferred *states* server-side, not biometric *values*. This is the architectural win that makes ADR-115 healthcare- and enterprise-deployable.
+`--privacy-mode` (env `RUVIEW_PRIVACY_MODE`) is a server-wide flag. It withholds heart rate, breathing rate, and pose keypoints from every output:
+
+- REST responses: the fields are removed from every JSON body (`/api/v1/sensing/latest`, `/api/v1/vital-signs`, `/api/v1/edge-vitals`, `/api/v1/pose/current`, ...). `/api/v1/pose/current?view=both|refined` returns `403` with `"code": "privacy_mode"`.
+- WebSocket streams: `/ws/sensing` and `/api/v1/stream/pose` frames are filtered the same way.
+- Recordings started with `POST /api/v1/recording/start` are written already filtered.
+- MQTT and Matter: those entities are neither announced nor published.
+
+Presence, motion, person count, zones and the coarse posture label are still served, and semantic primitives stay published because they're inferred *states*, not biometric *values*. Some of those states (sleeping, possible distress) are derived from vitals, so they are still health-related information. Privacy mode reduces what leaves the server. It does not by itself make a deployment compliant with any regulation.
 
 ### Matter Bridge (Apple Home / Google Home / Alexa / SmartThings)
 
@@ -1277,7 +1342,7 @@ The Rust sensing server binary accepts the following flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--source` | `auto` | Data source: `auto`, `simulate`, `wifi`, `esp32` |
+| `--source` | `auto` | Data source: `auto`, `esp32`, `wifi`, `simulated` (alias `simulate`), `mediatek`, `qualcomm`, `realtek`, `realtek_csi`. Other values are rejected at startup |
 | `--http-port` | `8080` | HTTP port for REST API and UI |
 | `--ws-port` | `8765` | WebSocket port |
 | `--udp-port` | `5005` | UDP port for ESP32 CSI frames |
@@ -1494,7 +1559,7 @@ curl -X POST http://localhost:3000/api/v1/recording/start \
 curl -X POST http://localhost:3000/api/v1/recording/stop
 ```
 
-Recordings are saved as JSONL files in `data/recordings/`. Filenames must start with `train_` and contain a class keyword:
+Recordings are saved as JSONL files in `recordings/` under the server's `--data-dir` (default `data`, so `data/recordings/` relative to the directory the server was started from). Filenames must start with `train_` and contain a class keyword:
 
 | Filename pattern | Class |
 |-----------------|-------|
@@ -1511,7 +1576,7 @@ Train the adaptive classifier from your labeled recordings:
 curl -X POST http://localhost:3000/api/v1/adaptive/train
 ```
 
-The server trains a multiclass logistic regression on 15 features using mini-batch SGD (200 epochs). Training completes in under 1 second for typical recording sets. The trained model is saved to `data/adaptive_model.json` and automatically loaded on server restart.
+The server trains a multiclass logistic regression on 15 features using mini-batch SGD (200 epochs). Training completes in under 1 second for typical recording sets. The trained model is saved to `adaptive_model.json` in the `--data-dir` (default `data/adaptive_model.json`) and automatically loaded on server restart.
 
 **Check model status:**
 
@@ -1531,7 +1596,7 @@ Once trained, the adaptive model runs automatically:
 
 1. Each CSI frame is classified using the learned weights instead of static thresholds
 2. Model confidence is blended with smoothed threshold confidence (70/30 split)
-3. The model persists across server restarts (loaded from `data/adaptive_model.json`)
+3. The model persists across server restarts (loaded from `<data-dir>/adaptive_model.json`)
 
 **Tips for better accuracy:**
 
@@ -2047,8 +2112,10 @@ Binary size: 990 KB (8MB flash, 52% free) or 773 KB (4MB flash). v0.5.0 adds mmW
 # From source
 ./target/release/sensing-server --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001
 
-# Docker (use CSI_SOURCE environment variable)
-docker run -p 3000:3000 -p 3001:3001 -p 5005:5005/udp -e CSI_SOURCE=esp32 ruvnet/wifi-densepose:latest
+# Docker (see "Receiving ESP32 frames in Docker" for the UDP source guard)
+docker run -p 127.0.0.1:3000:3000 -p 127.0.0.1:3001:3001 -p 5005:5005/udp \
+  -e RUVIEW_API_TOKEN -e CSI_SOURCE=esp32 -e RUVIEW_UDP_ALLOW=<node-ip-or-cidr> \
+  ruvnet/wifi-densepose:latest
 ```
 
 See [ADR-018](../docs/adr/ADR-018-esp32-dev-implementation.md), [ADR-029](../docs/adr/ADR-029-ruvsense-multistatic-sensing-mode.md), and [Tutorial #34](https://github.com/ruvnet/RuView/issues/34).
@@ -2377,12 +2444,16 @@ For production deployments with both Rust and Python services:
 
 ```bash
 cd docker
+export RUVIEW_API_TOKEN=$(openssl rand -hex 32)
+export RUVIEW_UDP_ALLOW=<node-ip-or-cidr>   # macOS Docker: <gateway>/32
 docker compose up
 ```
 
 This starts:
 - Rust sensing server on ports 3000 (HTTP), 3001 (WS), 5005 (UDP)
 - Python legacy server on ports 8080 (HTTP), 8765 (WS)
+
+The sensing server exits with code 64 when `RUVIEW_API_TOKEN` is unset. Without `RUVIEW_UDP_ALLOW` or `RUVIEW_UDP_INSECURE_LAN=true` it starts but receives no ESP32 frames. `docker/docker-compose.yml` passes these variables through from your shell, along with `RUVIEW_UDP_BIND` and `SENSING_ALLOWED_HOSTS`. See [Receiving ESP32 frames in Docker](#receiving-esp32-frames-in-docker).
 
 ---
 
