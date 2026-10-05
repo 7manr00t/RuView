@@ -6695,6 +6695,12 @@ async fn health_ready(State(state): State<SharedState>) -> Json<serde_json::Valu
             "recalibration_recommended": s.engine_bridge.recalibration_recommended(),
             "engine_error_count": s.engine_bridge.engine_error_count(),
             "raw_outputs_suppressed": s.engine_bridge.suppress_raw_outputs(),
+            // Issue #1752: whether phase was combined across nodes, and why
+            // not. Amplitude-only ESP32 nodes report "amplitude_only".
+            "phase_fusion": s.engine_bridge.phase_fusion().map(|p| serde_json::json!({
+                "mode": p.mode_str(),
+                "reason": p.reason().map(|r| r.as_str()),
+            })),
         },
     }))
 }
