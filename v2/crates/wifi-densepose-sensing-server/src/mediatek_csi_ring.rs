@@ -3,8 +3,9 @@
 //! `/api/v1/csi/mediatek/devices/:device_id/{frames,summary}` routes.
 //!
 //! `MediatekCsiSnapshot` (`mediatek_csi.rs`) deliberately keeps only
-//! mean/peak amplitude — enough for a coarse summary, but nothing for a
-//! human to actually look at the channel with. This module extracts full per-chain, per-subcarrier
+//! mean/peak amplitude — that's enough for the heuristic classifier
+//! (`mediatek_heuristic`) but nothing for a human to actually look at the
+//! channel with. This module extracts full per-chain, per-subcarrier
 //! amplitude and phase directly from each frame's raw MTC1 I/Q payload at
 //! ingest, and retains the last `capacity` frames per device — bounded, so
 //! memory stays fixed regardless of how long a device has been streaming.
@@ -22,6 +23,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use serde::Deserialize;
+use std::time::Duration;
 use wifi_densepose_hardware::mediatek_csi::{CsiFrame, CsiPayload};
 
 /// One (tx, rx) chain's per-subcarrier amplitude and phase for one frame.
@@ -142,6 +144,66 @@ impl DeviceRing {
             return 0.0;
         }
         (self.frames.len() - 1) as f64 / (span_us as f64 / 1_000_000.0)
+    }
+
+    /// "Fast" activity signal for `mediatek_activity`: the mean, over every
+    /// `(chain, subcarrier)` pair observed in the last `window` of ring
+    /// time (by frame timestamp, relative to the newest retained frame —
+    /// not wall-clock `Instant::now()`), of that pair's coefficient of
+    /// variation (`std / mean`) — a gain-normalized measure of how much the
+    /// channel is fluctuating right now. Returns `(fast, frame_count)`;
+    /// `frame_count` is also the module's `frames_2s`-style weight. `(0.0,
+    /// n)` when fewer than 2 frames fall in the window (a std needs at
+    /// least 2 samples).
+    pub(crate) fn fast_activity(&self, window: Duration) -> (f64, usize) {
+        let Some(newest) = self.frames.back() else {
+            return (0.0, 0);
+        };
+        let window_us = window.as_micros() as u64;
+        let recent: Vec<&RingFrame> = self
+            .frames
+            .iter()
+            .rev()
+            .take_while(|f| newest.timestamp_us.saturating_sub(f.timestamp_us) <= window_us)
+            .collect();
+        let n = recent.len();
+        if n < 2 {
+            return (0.0, n);
+        }
+        let sc = self.subcarrier_count as usize;
+        let mut cv_sum = 0.0f64;
+        let mut cv_count = 0usize;
+        for (tx, rx) in chain_union(recent.iter().copied()) {
+            let mut sum = vec![0.0f64; sc];
+            let mut sumsq = vec![0.0f64; sc];
+            let mut m = 0usize;
+            for frame in &recent {
+                let Some(c) = frame.chains.iter().find(|c| c.tx == tx && c.rx == rx) else {
+                    continue;
+                };
+                m += 1;
+                for (k, &a) in c.amplitude.iter().enumerate().take(sc) {
+                    sum[k] += a as f64;
+                    sumsq[k] += (a as f64) * (a as f64);
+                }
+            }
+            if m < 2 {
+                continue;
+            }
+            let m_f = m as f64;
+            for k in 0..sc {
+                let mean = sum[k] / m_f;
+                let variance = (sumsq[k] / m_f - mean * mean).max(0.0);
+                cv_sum += variance.sqrt() / mean.abs().max(1e-6);
+                cv_count += 1;
+            }
+        }
+        let fast = if cv_count > 0 {
+            cv_sum / cv_count as f64
+        } else {
+            0.0
+        };
+        (fast, n)
     }
 
     /// Per-chain amplitude mean and standard deviation across every
@@ -414,13 +476,14 @@ pub(crate) async fn mediatek_csi_frames(
 
 /// `GET /api/v1/csi/mediatek/devices/{device_id}/summary` — one call for the
 /// analysis view: per-subcarrier amplitude mean/std per chain
-/// over the ring, mean RSSI per Rx chain, and the ring's real frame rate.
+/// over the ring, mean RSSI per Rx chain, the ring's real frame rate, and
+/// the heuristic classifier's current window stats for the same device.
 /// `404` when `device_id` has no ring at all.
 pub(crate) async fn mediatek_csi_summary(
     State(state): State<SharedState>,
     Path(device_id): Path<String>,
 ) -> impl IntoResponse {
-    let s = state.read().await;
+    let mut s = state.write().await;
     let Some(ring) = s.mediatek_csi_ring_by_device.get(&device_id) else {
         return device_not_found(&device_id).into_response();
     };
@@ -451,6 +514,24 @@ pub(crate) async fn mediatek_csi_summary(
     let frame_rate_hz = ring.frame_rate_hz();
     let subcarrier_count = ring.subcarrier_count();
 
+    // Separate borrow: the heuristic's history lives in a different map on
+    // the same AppStateInner, and `verdict()` needs `&mut self` to prune by
+    // age — done after the (now-dropped) immutable `ring` borrow above ends.
+    let now = std::time::Instant::now();
+    let heuristic = s
+        .mediatek_heuristic_by_device
+        .get_mut(&device_id)
+        .map(|hist| hist.verdict(now))
+        .map(|v| {
+            serde_json::json!({
+                "presence_state": v.presence_state.as_str(),
+                "coefficient_of_variation": v.window.coefficient_of_variation,
+                "baseline_deviation": v.window.baseline_deviation,
+                "sample_count": v.window.sample_count,
+                "span_ms": v.window.span_ms,
+            })
+        });
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -461,6 +542,7 @@ pub(crate) async fn mediatek_csi_summary(
             "frame_rate_hz": frame_rate_hz,
             "rssi_by_rx_chain": rssi_by_rx_chain,
             "chains": chains,
+            "heuristic": heuristic,
         })),
     )
         .into_response()
@@ -623,6 +705,53 @@ mod tests {
         assert_eq!(by_pos[&(1, 1)], 2);
     }
 
+    #[test]
+    fn fast_activity_is_zero_for_a_flat_signal_and_positive_for_a_varying_one() {
+        let mut sim = MediatekCsiSimulator::new(SimulatorConfig {
+            tx_count: 1,
+            rx_count: 1,
+            subcarriers: 4,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut flat_ring = DeviceRing::new(16);
+        for _ in 0..8 {
+            flat_ring.push(&sim.next_frame());
+        }
+        // The ADR-266 simulator's amplitude has a slow motion phase, not
+        // frame-to-frame noise, so back-to-back frames read as effectively
+        // flat over a short window: fast_activity should be near zero.
+        let (fast_flat, n) = flat_ring.fast_activity(Duration::from_secs(2));
+        assert_eq!(n, 8);
+        assert!(
+            fast_flat < 0.05,
+            "expected a near-flat signal, got fast={fast_flat}"
+        );
+    }
+
+    #[test]
+    fn fast_activity_ignores_frames_outside_the_window() {
+        let mut sim = MediatekCsiSimulator::new(SimulatorConfig {
+            tx_count: 1,
+            rx_count: 1,
+            subcarriers: 4,
+            frame_period_us: 500_000, // 0.5s apart
+            ..Default::default()
+        })
+        .unwrap();
+        let mut ring = DeviceRing::new(16);
+        for _ in 0..8 {
+            ring.push(&sim.next_frame()); // spans 3.5s total
+        }
+        let (_, n_full) = ring.fast_activity(Duration::from_secs(10));
+        assert_eq!(n_full, 8, "a wide window covers every retained frame");
+        let (_, n_narrow) = ring.fast_activity(Duration::from_secs(1));
+        assert!(
+            n_narrow < 8,
+            "a 1s window must exclude older frames from a 3.5s-spanning ring, got {n_narrow}"
+        );
+    }
+
     mod endpoint_tests {
         //! Exercises `mediatek_csi_frames` / `mediatek_csi_summary` directly
         //! against `AppStateInner`, constructing the axum extractors by hand
@@ -751,6 +880,11 @@ mod tests {
                 .as_array()
                 .expect("rssi_by_rx_chain array");
             assert_eq!(rssi.len(), 1, "1 rx chain");
+
+            // heuristic is present but null when this device never went
+            // through mediatek_heuristic_by_device (this test only seeds the
+            // ring, mirroring a device whose heuristic hasn't observed yet).
+            assert!(body["heuristic"].is_null());
         }
 
         #[tokio::test]
