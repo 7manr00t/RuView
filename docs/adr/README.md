@@ -4,6 +4,7 @@ Latest proposed decisions:
 
 - [ADR-379: An OTA'd image confirms itself with a bounded health check, or rolls back](ADR-379-ota-first-boot-health-check.md)
 - [ADR-380: Loopback UDP tee for second consumers of the CSI stream](ADR-380-loopback-udp-tee.md)
+- [ADR-382: `spatial.evidence.v1` export of RF Gaussians and link observations](ADR-382-spatial-evidence-rf-export.md)
 - [ADR-378: `ruview-live` showcase views — CSI waterfall, radar fan, animated cells](ADR-378-ruview-live-showcase-views.md)
 - [ADR-377: `ruview-live` — a Claude Code mod shipped inside `@ruvnet/ruview`](ADR-377-ruview-live-claude-code-mod.md)
 - [ADR-376: `ruview` — one npm install for every RuView component](ADR-376-ruview-umbrella-npm-package.md)

@@ -128,6 +128,9 @@ members = [
     # ADR-368 — portable compute kernel for the `@ruvnet/ruview-kernel` npm
     # package: one bounded JSON ABI, wasm32 (zero-import) + napi-rs transports.
     "crates/ruview-kernel",
+    # spatial.evidence.v1 emitter (WeftOS ADR-107 wire contract): RF Gaussians
+    # and link measurements as JSONL evidence. Leaf over ruview-unified.
+    "crates/ruview-spatial-evidence",
     # ADR-348 — RuForecast extracted to the ruvnet/RuForecast submodule
     # (see crates/ruforecast in the exclude list below); path-deps only.
 ]

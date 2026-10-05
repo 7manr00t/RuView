@@ -9560,6 +9560,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruview-spatial-evidence"
+version = "0.3.1"
+dependencies = [
+ "ruview-unified",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ruview-spatial-memory"
 version = "0.3.1"
 dependencies = [
