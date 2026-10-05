@@ -221,7 +221,7 @@ impl RadarAdapterConfig {
 }
 
 /// Why a window produced no label.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnknownReason {
     /// The reader had no sensor data for the window.
