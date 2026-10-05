@@ -198,7 +198,15 @@ def _write_private(path: str, data: bytes) -> None:
     """Write a credential-bearing file (state, NVS CSV or binary) as 0600."""
     flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
              | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
-    fd = os.open(path, flags, STATE_FILE_MODE)
+    try:
+        fd = os.open(path, flags, STATE_FILE_MODE)
+    except OSError as exc:
+        # O_NOFOLLOW makes a pre-existing symlink fail here (ELOOP).
+        if os.path.islink(path):
+            raise SystemExit(
+                f"ERROR: refusing to write credentials through a symlink: {path}. "
+                f"Remove it and rerun.") from exc
+        raise
     with os.fdopen(fd, "wb") as f:
         # O_CREAT ignores the mode when the file already exists.
         if hasattr(os, "fchmod"):
