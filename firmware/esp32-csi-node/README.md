@@ -161,9 +161,15 @@ board default and emits no antenna-path claim.
 ### 3. Provision WiFi credentials (no reflash needed)
 
 ```bash
+# Keep the WiFi password in an owner-only file, not on the command line.
+printf '%s\n' 'YourPass' > ~/.wifi-pass && chmod 600 ~/.wifi-pass
 python firmware/esp32-csi-node/provision.py --port COM7 \
-  --ssid "YourSSID" --password "YourPass" --target-ip 192.168.1.20
+  --ssid "YourSSID" --password-file ~/.wifi-pass --target-ip 192.168.1.20
 ```
+
+Leave out both `--password` and `--password-file` and the script asks for the
+password when run from a terminal. `--password` still works, but it shows up in
+`ps` and shell history.
 
 ### 4. Start the sensing server
 
@@ -440,9 +446,14 @@ The easiest way to write NVS settings:
 ```bash
 python firmware/esp32-csi-node/provision.py --port COM7 \
   --ssid "MyWiFi" \
-  --password "MyPassword" \
+  --password-file ~/.wifi-pass \
   --target-ip 192.168.1.20
 ```
+
+The password file must be owner-only (`chmod 600`); one trailing newline is
+dropped. Without a password flag the script prompts on a terminal; in scripts
+and CI it doesn't prompt and fails if no password was given now or saved
+earlier for that port.
 
 ### NVS Key Reference
 
