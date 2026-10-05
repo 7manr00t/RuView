@@ -1096,6 +1096,9 @@ struct NodeState {
     /// the two symbol grids in `frame_history` corrupts variance/baseline
     /// statistics. See [`NodeState::accept_grid`].
     active_grid: Option<(u16, wifi_densepose_hardware::PpduType)>,
+    /// Grids of this node's last `GRID_VOTE_FRAMES` frames, accepted or not.
+    /// `accept_grid` locks onto the most frequent one.
+    grid_votes: VecDeque<(u16, wifi_densepose_hardware::PpduType)>,
     /// Header-only recent raw grid observations used to choose one stable,
     /// comparable calibration stream. No CSI amplitudes are retained here.
     raw_grid_observations: VecDeque<RawGridObservation>,
@@ -1472,6 +1475,7 @@ impl NodeState {
             ),
             last_novelty_score: None,
             active_grid: None,
+            grid_votes: VecDeque::with_capacity(GRID_VOTE_FRAMES),
             raw_grid_observations: VecDeque::with_capacity(
                 CALIBRATION_GRID_EVIDENCE_CAPACITY,
             ),
@@ -1566,10 +1570,11 @@ impl NodeState {
                     && evidence.max_gap_s < CALIBRATION_GRID_MAX_GAP_S
                     && evidence.latest_age_s < CALIBRATION_GRID_MAX_GAP_S
             })
-            // Density first, to agree with `accept_grid`. That gate locks each
-            // node onto the densest grid it has seen and rejects sparser
-            // frames from the feature path -- on an ESP32-C6 the ~16% HT
-            // 64-bin minority alongside HE-SU 256-bin. Ordering selection by
+            // Density first. This was chosen to agree with `accept_grid` when
+            // that gate locked each node onto the densest grid it had seen;
+            // since #1894 the gate locks onto the most frequent grid instead,
+            // and this ordering has not been revisited. On an ESP32-C6 both
+            // pick HE-SU 256-bin over the ~16% HT 64-bin minority. Ordering selection by
             // gap first picked exactly that minority: it is sparse, so its
             // arrivals look smooth, while the grid the node actually keeps
             // using scores worse on gap.
@@ -1613,29 +1618,41 @@ impl NodeState {
     /// ADR-110 / issue #1005 grid gate: decide whether a frame on `grid`
     /// may enter this node's feature path, and update `active_grid`.
     ///
-    /// Returns `true` to accept. Policy: lock onto the densest grid seen.
-    /// On a grid *upgrade* (more subcarriers — e.g. the first HE-SU 256-bin
-    /// frame after HT 64-bin history) the rolling amplitude history and
-    /// motion baseline are cleared so HT and HE symbol grids are never
-    /// mixed in one window. Sparser-grid frames (the ~16% HT minority an
-    /// ESP32-C6 keeps emitting alongside HE) are rejected from the feature
-    /// path; the caller still records the arrival for fps/liveness.
+    /// Returns `true` to accept. Policy: lock onto the grid this node sends
+    /// most often over its last `GRID_VOTE_FRAMES` frames, and accept only
+    /// frames on that grid. Switching needs the challenger to outnumber the
+    /// active grid by 3:2, so interleaved grids don't flap the lock. On a
+    /// switch the rolling amplitude history and motion baseline are cleared
+    /// so two symbol grids are never mixed in one window. On an ESP32-C6
+    /// the HE-SU 256-bin grid is ~84% of frames, so the ~16% HT minority is
+    /// rejected as before; the caller still records the arrival for
+    /// fps/liveness.
+    ///
+    /// Issue #1894: this used to lock onto the densest grid ever seen. Real
+    /// ESP32-S3 nodes interleave several grids (one measured node: 192 bins
+    /// on 88% of frames, 306 on 6%), so that locked onto the 306 minority
+    /// and rejected nearly every frame; a node whose radio moved to a
+    /// sparser grid for good was rejected forever.
     fn accept_grid(&mut self, grid: (u16, wifi_densepose_hardware::PpduType)) -> bool {
-        match self.active_grid {
-            None => {
-                self.active_grid = Some(grid);
-                true
-            }
-            Some(active) if active == grid => true,
-            Some((active_n, _)) if grid.0 > active_n => {
+        if self.grid_votes.len() == GRID_VOTE_FRAMES {
+            self.grid_votes.pop_front();
+        }
+        self.grid_votes.push_back(grid);
+        let Some(active) = self.active_grid else {
+            self.active_grid = Some(grid);
+            return true;
+        };
+        if grid != active {
+            let votes = |g| self.grid_votes.iter().filter(|&&v| v == g).count();
+            if 2 * votes(grid) > 3 * votes(active) {
                 self.active_grid = Some(grid);
                 self.frame_history.clear();
                 self.baseline_motion = 0.0;
                 self.baseline_frames = 0;
-                true
+                return true;
             }
-            Some(_) => false,
         }
+        grid == active
     }
 
     /// ADR-084 cluster-Pi novelty step. Truncates / zero-pads the
@@ -2159,6 +2176,10 @@ mod adr323_pose_physics_http_tests {
 
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
 const ESP32_OFFLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How many recent frames per node the grid gate votes over (see
+/// `NodeState::accept_grid`): about a second of CSI at typical rates.
+const GRID_VOTE_FRAMES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CalibrationSequenceOrder {
@@ -5602,11 +5623,16 @@ async fn handle_ws_pose_client(mut socket: WebSocket, state: SharedState) {
 
 async fn health(State(state): State<SharedState>) -> Json<serde_json::Value> {
     let s = state.read().await;
+    let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     Json(serde_json::json!({
         "status": "ok",
         "source": s.effective_source(),
         "tick": s.tick,
         "clients": s.tx.receiver_count(),
+        "processing": processing_health(
+            s.latest_update.as_ref().map(|u| u.timestamp),
+            now_unix_ms,
+        ),
     }))
 }
 
@@ -10641,6 +10667,234 @@ mod node_states_eviction_tests {
     }
 }
 
+#[cfg(test)]
+mod grid_gate_tests {
+    use super::*;
+    use wifi_densepose_hardware::PpduType;
+
+    fn ht(n: u16) -> (u16, PpduType) {
+        (n, PpduType::HtLegacy)
+    }
+
+    /// Run-length grid order of the first 320 CSI frames from one real
+    /// ESP32-S3 node (firmware 0.8.12, 2432 MHz, 1 antenna): 192 bins on
+    /// most frames, with 306, 128 and 188 interleaved. Header sizes only.
+    const S3_NODE_GRID_RUNS: &[(u16, usize)] = &[
+        (192, 19), (128, 2), (192, 5), (128, 1), (192, 6), (306, 1), (192, 14),
+        (128, 1), (192, 55), (306, 2), (192, 1), (306, 1), (128, 1), (192, 6),
+        (188, 1), (128, 2), (192, 1), (306, 1), (192, 7), (306, 1), (192, 35),
+        (128, 1), (192, 6), (306, 1), (192, 28), (306, 1), (192, 10), (128, 1),
+        (192, 4), (306, 1), (192, 4), (306, 1), (192, 9), (306, 2), (192, 6),
+        (128, 1), (192, 13), (306, 1), (192, 11), (306, 1), (192, 3), (128, 1),
+        (192, 27), (128, 1), (192, 13), (128, 1), (192, 3), (306, 1), (192, 1),
+        (306, 1), (192, 3),
+    ];
+
+    /// Issue #1894: locking onto the densest grid seen kept only the 306-bin
+    /// minority of this node and rejected ~90% of its frames. The gate must
+    /// keep the grid the node mostly sends, without flapping.
+    #[test]
+    fn real_s3_interleaved_grids_keep_the_majority_grid() {
+        let mut ns = NodeState::new();
+        let (mut accepted, mut on_192, mut switches) = (0, 0, 0);
+        for &(n, run) in S3_NODE_GRID_RUNS {
+            for _ in 0..run {
+                let before = ns.active_grid;
+                if ns.accept_grid(ht(n)) {
+                    accepted += 1;
+                }
+                if before.is_some() && ns.active_grid != before {
+                    switches += 1;
+                }
+                on_192 += usize::from(n == 192);
+            }
+        }
+        assert_eq!(ns.active_grid, Some(ht(192)));
+        assert_eq!(switches, 0, "interleaved grids must not flap the lock");
+        assert_eq!(accepted, on_192, "every 192-bin frame and nothing else");
+        assert!(accepted * 10 > 320 * 8, "accepted {accepted} of 320");
+    }
+
+    /// The other real node sends 306 on about two frames in three and 192 on
+    /// the rest. A 2:1 interleave must hold the 306 lock.
+    #[test]
+    fn two_to_one_interleave_does_not_flap() {
+        let mut ns = NodeState::new();
+        let mut accepted = 0;
+        for i in 0..300 {
+            let n = if i % 3 == 2 { 192 } else { 306 };
+            accepted += usize::from(ns.accept_grid(ht(n)));
+        }
+        assert_eq!(ns.active_grid, Some(ht(306)));
+        assert_eq!(accepted, 200);
+    }
+
+    /// A node whose radio moves to a sparser grid for good is re-locked once
+    /// the new grid dominates the vote window, with the old window cleared.
+    #[test]
+    fn permanent_drift_to_a_sparser_grid_relocks() {
+        let mut ns = NodeState::new();
+        for _ in 0..GRID_VOTE_FRAMES {
+            assert!(ns.accept_grid(ht(128)));
+        }
+        ns.frame_history.push_back(vec![1.0; 128]);
+        let mut first_accept = None;
+        for i in 0..GRID_VOTE_FRAMES {
+            if ns.accept_grid(ht(64)) && first_accept.is_none() {
+                first_accept = Some(i);
+                assert!(ns.frame_history.is_empty(), "relock must clear the window");
+            }
+        }
+        let first = first_accept.expect("64-bin stream never re-locked");
+        assert!(first < GRID_VOTE_FRAMES, "re-locked after {first} frames");
+        assert_eq!(ns.active_grid, Some(ht(64)));
+    }
+
+    /// ESP32-C6 (#1005): HE-SU 256 on ~84% of frames, HT 64 on the rest.
+    /// The HT minority stays out of the feature path.
+    #[test]
+    fn c6_he_majority_rejects_ht_minority() {
+        let mut ns = NodeState::new();
+        assert!(ns.accept_grid(ht(64))); // HT frame first after boot
+        for i in 0..200 {
+            let he = (256, PpduType::HeSu);
+            if i % 6 == 5 {
+                ns.accept_grid(ht(64));
+            } else {
+                ns.accept_grid(he);
+            }
+        }
+        assert_eq!(ns.active_grid, Some((256, PpduType::HeSu)));
+        assert!(!ns.accept_grid(ht(64)));
+    }
+}
+
+/// Receive-side counters for the UDP data plane (issue #1894). Updated by
+/// `udp_receiver_task` straight after `recv_from`, before any parsing or the
+/// state lock, so `/health` can tell "datagrams stopped arriving" apart from
+/// "datagrams arrive but nothing is published".
+struct UdpIngress {
+    running: std::sync::atomic::AtomicBool,
+    datagrams: std::sync::atomic::AtomicU64,
+    last_datagram_unix_ms: std::sync::atomic::AtomicU64,
+    dropped_by_allowlist: std::sync::atomic::AtomicU64,
+}
+
+static UDP_INGRESS: UdpIngress = UdpIngress {
+    running: std::sync::atomic::AtomicBool::new(false),
+    datagrams: std::sync::atomic::AtomicU64::new(0),
+    last_datagram_unix_ms: std::sync::atomic::AtomicU64::new(0),
+    dropped_by_allowlist: std::sync::atomic::AtomicU64::new(0),
+};
+
+/// Liveness of the sensing pipeline as reported on `/health`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessingState {
+    /// Nothing has been received or published yet.
+    Idle,
+    /// A sensing update was published within the stale window.
+    Live,
+    /// Datagrams are arriving but no update has been published within the
+    /// stale window: frames are being dropped or the pipeline is stuck.
+    Stalled,
+    /// Input has stopped: neither datagrams nor updates within the window.
+    NoInput,
+}
+
+impl ProcessingState {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProcessingState::Idle => "idle",
+            ProcessingState::Live => "live",
+            ProcessingState::Stalled => "stalled",
+            ProcessingState::NoInput => "no_input",
+        }
+    }
+}
+
+fn processing_state(
+    update_age_ms: Option<u64>,
+    datagram_age_ms: Option<u64>,
+    stale_after_ms: u64,
+) -> ProcessingState {
+    let fresh = |age: Option<u64>| age.is_some_and(|a| a <= stale_after_ms);
+    if fresh(update_age_ms) {
+        ProcessingState::Live
+    } else if fresh(datagram_age_ms) {
+        ProcessingState::Stalled
+    } else if update_age_ms.is_some() || datagram_age_ms.is_some() {
+        ProcessingState::NoInput
+    } else {
+        ProcessingState::Idle
+    }
+}
+
+/// The `processing` block of `/health`. `status` stays `"ok"` (the server is
+/// up and the UI's server probe keys on it); this block says whether the
+/// sensing pipeline behind it is still producing. `update_timestamp_s` is
+/// the wall-clock stamp of the latest published `SensingUpdate`.
+fn processing_health(update_timestamp_s: Option<f64>, now_unix_ms: u64) -> serde_json::Value {
+    use std::sync::atomic::Ordering;
+    let update_age_ms = update_timestamp_s
+        .map(|ts| now_unix_ms.saturating_sub((ts * 1000.0).max(0.0) as u64));
+    let udp_running = UDP_INGRESS.running.load(Ordering::Relaxed);
+    let last_datagram = UDP_INGRESS.last_datagram_unix_ms.load(Ordering::Relaxed);
+    let datagram_age_ms = (udp_running && last_datagram > 0)
+        .then(|| now_unix_ms.saturating_sub(last_datagram));
+    let state = processing_state(
+        update_age_ms,
+        datagram_age_ms,
+        ESP32_OFFLINE_TIMEOUT.as_millis() as u64,
+    );
+    let mut out = serde_json::json!({
+        "state": state.as_str(),
+        "last_update_age_ms": update_age_ms,
+    });
+    if udp_running {
+        out["udp"] = serde_json::json!({
+            "datagrams": UDP_INGRESS.datagrams.load(Ordering::Relaxed),
+            "last_datagram_age_ms": datagram_age_ms,
+            "dropped_by_allowlist": UDP_INGRESS.dropped_by_allowlist.load(Ordering::Relaxed),
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod processing_state_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_update_is_live_regardless_of_udp() {
+        assert_eq!(processing_state(Some(100), None, 5_000), ProcessingState::Live);
+        assert_eq!(processing_state(Some(100), Some(90_000), 5_000), ProcessingState::Live);
+    }
+
+    /// Issue #1894: tick frozen while datagrams keep arriving must not read
+    /// as healthy.
+    #[test]
+    fn datagrams_without_updates_is_stalled() {
+        assert_eq!(processing_state(Some(60_000), Some(50), 5_000), ProcessingState::Stalled);
+        assert_eq!(processing_state(None, Some(50), 5_000), ProcessingState::Stalled);
+    }
+
+    #[test]
+    fn nothing_recent_is_no_input_and_nothing_ever_is_idle() {
+        assert_eq!(processing_state(Some(60_000), Some(60_000), 5_000), ProcessingState::NoInput);
+        assert_eq!(processing_state(Some(60_000), None, 5_000), ProcessingState::NoInput);
+        assert_eq!(processing_state(None, None, 5_000), ProcessingState::Idle);
+    }
+
+    #[test]
+    fn health_block_reports_update_age() {
+        assert_eq!(processing_health(None, 1_000_000)["state"], "idle");
+        let out = processing_health(Some(990.0), 1_000_000);
+        assert_eq!(out["last_update_age_ms"], 10_000);
+        assert_eq!(out["state"], "no_input");
+        assert_eq!(processing_health(Some(999.5), 1_000_000)["state"], "live");
+    }
+}
+
 // ── UDP receiver task ────────────────────────────────────────────────────────
 
 async fn udp_receiver_task(
@@ -10661,17 +10915,41 @@ async fn udp_receiver_task(
         }
     };
 
+    UDP_INGRESS
+        .running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     let mut buf = vec![0u8; wifi_densepose_hardware::rtl8720f::RTL8720F_RADAR_MAX_FRAME_LEN];
     loop {
         match socket.recv_from(&mut buf).await {
             Ok((len, src)) => {
+                UDP_INGRESS
+                    .datagrams
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                UDP_INGRESS.last_datagram_unix_ms.store(
+                    chrono::Utc::now().timestamp_millis().max(0) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 // ADR-296: drop frames from sources outside the allowlist
                 // (loopback is always admitted). Counted for observability.
                 if !allowlist.admit(src.ip()) {
-                    debug!(
-                        "Dropped UDP frame from disallowed source {src} (allowlist active; total dropped={})",
-                        allowlist.dropped()
-                    );
+                    let dropped = UDP_INGRESS
+                        .dropped_by_allowlist
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    // Issue #1894: an allowlist that rejects every datagram
+                    // (e.g. a container runtime rewriting the source address)
+                    // used to freeze sensing with nothing in the log. Warn on
+                    // the 1st, 2nd, 4th, 8th... drop so it shows without
+                    // flooding.
+                    if dropped.is_power_of_two() {
+                        warn!(
+                            "Dropped UDP frame from disallowed source {src} (allowlist active; total dropped={dropped})"
+                        );
+                    } else {
+                        debug!(
+                            "Dropped UDP frame from disallowed source {src} (allowlist active; total dropped={dropped})"
+                        );
+                    }
                     continue;
                 }
                 if len > 0 && buf[0] == b'{' {
