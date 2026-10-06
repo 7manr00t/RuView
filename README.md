@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://ruos.cognitum.one">
-    <img src="assets/ruos-animated.svg" alt="ruOS — A desktop that runs itself, powered by Ruflo" width="100%">
+    <img src="assets/ruos-animated.svg" alt="RuView — WiFi becomes spatial awareness, with Ruflo coordination and a ruOS sensing workspace" width="100%">
   </a>
 </p>
 
