@@ -6,6 +6,12 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://ruos.cognitum.one">
+    <img src="assets/ruos-animated.svg" alt="ruOS — A desktop that runs itself, powered by Ruflo" width="100%">
+  </a>
+</p>
+
 
 ## **See through walls with WiFi** ##
 
