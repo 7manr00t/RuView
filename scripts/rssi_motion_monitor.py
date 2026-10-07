@@ -171,7 +171,14 @@ class WindowsRssi:
             m = re.search(r"^\s*Signal\s*:\s*(\d+)\s*%", block, re.MULTILINE)
             if m:
                 return int(m.group(1)) / 2.0 - 100.0
-        raise RssiUnavailable("netsh reported no connected WiFi interface.")
+        if "location" in out.lower():
+            raise RssiUnavailable(
+                "Windows is blocking WiFi info until Location is allowed. Open "
+                "Settings > Privacy & security > Location, turn on Location services "
+                "and 'Let desktop apps access your location', then retry."
+            )
+        raise RssiUnavailable("netsh reported no connected WiFi interface "
+                              "(or a non-English Windows; this parser expects 'Signal').")
 
 
 def open_source(interface: Optional[str]):
