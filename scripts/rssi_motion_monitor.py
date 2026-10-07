@@ -150,9 +150,10 @@ class MacRssi:
 
 
 class WindowsRssi:
-    """Reads signal quality from `netsh wlan show interfaces` and converts to dBm.
+    """Reads RSSI from `netsh wlan show interfaces`.
 
-    Windows exposes whole-percent quality; dBm ~= quality/2 - 100 (0.5 dB steps).
+    Uses the `Rssi : -67` line (dBm) when Windows prints it; otherwise falls
+    back to whole-percent quality converted as dBm ~= quality/2 - 100.
     """
 
     def __init__(self, interface: Optional[str] = None):
@@ -168,6 +169,10 @@ class WindowsRssi:
         for block in blocks:
             if self.interface and self.interface not in block:
                 continue
+            # Recent Windows 11 builds print the driver's dBm directly; prefer it.
+            m = re.search(r"^\s*Rssi\s*:\s*(-\d+)", block, re.MULTILINE)
+            if m:
+                return float(m.group(1))
             m = re.search(r"^\s*Signal\s*:\s*(\d+)\s*%", block, re.MULTILINE)
             if m:
                 return int(m.group(1)) / 2.0 - 100.0
